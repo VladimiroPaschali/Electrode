@@ -30,6 +30,7 @@ def main():
     a = ap.parse_args()
 
     outdir = a.outdir or os.path.dirname(os.path.abspath(a.csv))
+    os.makedirs(outdir, exist_ok=True)
 
     rows = defaultdict(list)
     dropped = 0
@@ -84,13 +85,15 @@ def main():
 
     # pgfplots: one file per (replicas, variant), x = clients, y = kops, with
     # the latency alongside so a throughput-latency curve needs no second file.
+    # Gathered first and written once, so a rerun never appends to a stale file.
+    files = defaultdict(list)
     for (n, v, t), s in sorted(summary.items()):
-        path = os.path.join(outdir, f"pgf_n{n}_{v}.dat")
-        new = not os.path.exists(path) or (n, v, min(threads)) == (n, v, t)
-        with open(path, "w" if new else "a") as fh:
-            if new:
-                fh.write("clients kops kops_sd p50_us p99_us\n")
-            fh.write(f"{t} {s['tp']:.3f} {s['tp_sd']:.3f} {s['med']:.3f} {s['p99']:.3f}\n")
+        files[(n, v)].append(
+            f"{t} {s['tp']:.3f} {s['tp_sd']:.3f} {s['med']:.3f} {s['p99']:.3f}")
+    for (n, v), lines in files.items():
+        with open(os.path.join(outdir, f"pgf_n{n}_{v}.dat"), "w") as fh:
+            fh.write("clients kops kops_sd p50_us p99_us\n")
+            fh.write("\n".join(lines) + "\n")
     print(f"pgfplots tables in {outdir}/pgf_n<replicas>_<variant>.dat")
 
 

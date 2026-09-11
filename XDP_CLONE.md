@@ -138,11 +138,38 @@ legacy-RQ path) and `xdp_tx_mpwqe off` (an MPWQE session shares one eseg
 between packets, so the inline header would be silently ignored). `run.sh`
 refuses to start otherwise.
 
+## Measuring it
+
+Throughput is the **sum of the per-client rates**, `sum(N_i / T_i)`. The
+obvious `sum(N_i) / max(T_i)` is the same number only while the clients finish
+together, and silently wrong when they do not: at seven replicas one client
+process saturated its core -- 85% against the leader's 75%, because
+`VRClient::SendRequest()` sends one unicast per replica and that is seven per
+request -- the clients spread over 1.2x, and the metric read 25.9 kops where
+the cluster was serving 44.8.
+
+Two things follow, and both are in the harness now. The clients are spread over
+one process per core (`--client-procs`), which puts the bottleneck back on the
+leader, where the experiment wants it: at seven replicas the leader then sits
+at 77-81% and no client process is among the six busiest. And `elapsed_spread`,
+`max(T_i)/min(T_i)`, is recorded next to every measurement, so a run whose
+clients were served unevenly says so instead of folding it into the throughput.
+
+The symptom worth remembering: under a closed loop, `clients / throughput`
+should equal the reported median latency. Where it did not -- 1.23 to 1.45
+against 1.00 to 1.03 everywhere else -- the harness was the thing being
+measured.
+
 ## Known limits
 
-- **Namespaces, not machines.** The three replicas share grecale's CPU, so the
+- **Namespaces, not machines.** The replicas share grecale's CPU, so the
   absolute throughput is not comparable with the paper's; the four variants are
   comparable with each other, which is what the experiment is for.
+- **The fan-out node is nowhere near its limit here.** Maestrale's busiest core
+  is 94-99% idle during a run, which is why `xdp` and `xdp-inline` come out the
+  same: the shared page and the missing 320-byte memcpy are a saving on a
+  resource nothing is competing for. That difference belongs to
+  `microbenchmark/`, which measures the node itself.
 - **The TC point nests `bpf_clone_redirect`.** One level per follower, against
   the kernel's `xmit_recursion` limit of 8 — fine to seven replicas, not beyond.
 - **View changes are not handled**, upstream's own caveat. A run in which one

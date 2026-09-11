@@ -96,6 +96,14 @@ second). It does two jobs:
 fan-out that excluded the leader would drop every client request on the floor,
 which is exactly what the first version did.
 
+That same call is also why `SendMessageToAll()` uses the fan-out **for replicas
+only**. `TC_BROADCAST` acts on packets whose view word has the top bit set, and
+only the leader's `CloseBatch()`, `SendNullCommit()` and `ResendPrepare()` set
+it; offloading the client's request broadcast as well would hand the XDP points
+a saving the TC point does not have, and with `-t` clients sharing one process
+and one event loop, a large one. The client sends its three unicasts in all
+four variants.
+
 On the inline build nothing in the packet is written at all: the 42-byte
 Ethernet/IP/UDP header is built in the run's own metadata, stamped with
 `axdp_stamp_tx_replace()`, and the NIC puts it on the wire in place of the

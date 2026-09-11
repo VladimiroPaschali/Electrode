@@ -81,10 +81,14 @@ cmd_stop() {
         rm -f "$p"
     done
     sleep 0.5
+    # The client too: a run that timed out leaves one behind, and the next
+    # build then fails with ETXTBSY on the binary it is still executing.
     pkill -f "$root/build/.*/replica" 2>/dev/null || true
+    pkill -f "$root/build/.*/client" 2>/dev/null || true
     pkill -f "$root/xdp-handler/fast" 2>/dev/null || true
     sleep 0.3
     pkill -9 -f "$root/build/.*/replica" 2>/dev/null || true
+    pkill -9 -f "$root/build/.*/client" 2>/dev/null || true
     echo stopped
 }
 

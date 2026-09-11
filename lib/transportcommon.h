@@ -91,17 +91,25 @@ public:
 
 #ifdef XDP_BROADCAST
         // One packet to the fan-out node, which turns it into one per
-        // follower with XDP_CLONE_TX. The counterpart of TC_BROADCAST, where
+        // recipient with XDP_CLONE_TX. The counterpart of TC_BROADCAST, where
         // the leader also sends once and bpf_clone_redirect() makes the copies
         // on its own egress path -- the difference being where the duplication
         // happens, and therefore how many packets cross the wire.
         //
-        // Nothing is marked in the payload. TC_BROADCAST sets the top bit of
-        // the view word, some ninety bytes into the frame; the fan-out node
-        // recognises the broadcast by the address it is sent to instead, which
-        // is the only thing reachable from a 64-byte WQE inline header and so
-        // the only thing the shared-page build could act on.
-        {
+        // Replicas only, which is where TC_BROADCAST applies too: it acts on
+        // the packets whose view word has the top bit set, and only the
+        // leader's CloseBatch(), SendNullCommit() and ResendPrepare() set it.
+        // VRClient::SendRequest() broadcasts every request, retries included,
+        // so offloading that as well would give the XDP points a saving on the
+        // client that the TC point does not have -- and with the clients in one
+        // process, a large one.
+        //
+        // Nothing is marked in the payload. TC_BROADCAST's bit sits some
+        // ninety bytes into the frame; the fan-out node recognises a broadcast
+        // by the address it is sent to instead, which is the only thing
+        // reachable from a 64-byte WQE inline header and so the only thing the
+        // shared-page build could act on.
+        if (IsReplica(src)) {
             auto fkv = fanoutAddresses.find(cfg);
             if (fkv == fanoutAddresses.end()) {
                 Panic("XDP_BROADCAST needs a 'fanout host:port' line in the "
@@ -132,6 +140,22 @@ public:
     }
     
 protected:
+    // Whether this receiver was registered as a replica rather than a client.
+    bool IsReplica(TransportReceiver *src) {
+        const specpaxos::Configuration *cfg = configurations[src];
+        auto it = replicaReceivers.find(cfg);
+
+        if (it == replicaReceivers.end()) {
+            return false;
+        }
+        for (auto &kv : it->second) {
+            if (kv.second == src) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     virtual bool SendMessageInternal(TransportReceiver *src,
                                      const ADDR &dst,
                                      const Message &m,

@@ -48,15 +48,21 @@ on)
     ;;
 off)
     if [ -e "$save.coalesce" ]; then
-        # Restore the four knobs this script touched, from the saved dump.
-        get() { awk -F: "/^$1:/ {gsub(/ /,\"\",\$2); print \$2}" "$save.coalesce"; }
+        # `ethtool -c` prints the adaptive pair on one line,
+        #   Adaptive RX: on  TX: on
+        # and everything else as "name: value". Splitting that first line on
+        # ":" gave "offTX" and every restore of it failed silently, which left
+        # both machines with adaptive coalescing off after a run.
+        val() { awk -v k="$1" -F': *' '$1 == k {print $2; exit}' "$save.coalesce"; }
+        arx=$(awk '/^Adaptive RX:/ {print $3}' "$save.coalesce")
+        atx=$(awk '/^Adaptive RX:/ {print $5}' "$save.coalesce")
+
+        ethtool -C "$dev" adaptive-rx "${arx:-on}" adaptive-tx "${atx:-on}" \
+            2>/dev/null || echo "warning: could not restore adaptive coalescing" >&2
         ethtool -C "$dev" \
-            adaptive-rx "$(get 'Adaptive RX' | cut -d' ' -f1 || echo on)" \
-            2>/dev/null || true
-        ethtool -C "$dev" \
-            rx-usecs "$(get 'rx-usecs')" rx-frames "$(get 'rx-frames')" \
-            tx-usecs "$(get 'tx-usecs')" tx-frames "$(get 'tx-frames')" \
-            2>/dev/null || true
+            rx-usecs "$(val rx-usecs)" rx-frames "$(val rx-frames)" \
+            tx-usecs "$(val tx-usecs)" tx-frames "$(val tx-frames)" \
+            2>/dev/null || echo "warning: could not restore coalescing values" >&2
         rm -f "$save.coalesce"
     fi
     if [ -e "$save.governor" ]; then

@@ -141,6 +141,18 @@ UDPTransport::LookupMulticastAddress(const specpaxos::Configuration
     return addr;
 }
 
+/* The fan-out node. No equivalent of the multicastFds check here: this address
+ * is on another machine, so nothing local ever listens on it.
+ */
+const UDPTransportAddress *
+UDPTransport::LookupFanoutAddress(const specpaxos::Configuration *config)
+{
+    if (!config->fanout()) {
+        return NULL;
+    }
+    return new UDPTransportAddress(LookupAddress(*(config->fanout())));
+}
+
 static void
 BindToPort(int fd, const string &host, const string &port)
 {

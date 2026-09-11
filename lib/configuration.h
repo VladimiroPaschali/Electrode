@@ -65,6 +65,13 @@ public:
     virtual ~Configuration();
     ReplicaAddress replica(int idx) const;
     const ReplicaAddress *multicast() const;
+    /* XDP_CLONE: the intermediate node that fans a broadcast out. Electrode's
+     * own broadcast offload duplicates the packet on the leader's TC egress
+     * hook; XDP cannot, because a locally generated packet never passes an XDP
+     * hook, so the leader sends one packet here and the copies are made where
+     * it arrives. Set with a 'fanout host:port' line in the config file.
+     */
+    const ReplicaAddress *fanout() const;
     inline int GetLeaderIndex(view_t view) const {
         return (view % n);
     };
@@ -82,6 +89,8 @@ private:
     std::vector<ReplicaAddress> replicas;
     ReplicaAddress *multicastAddress;
     bool hasMulticast;
+    ReplicaAddress *fanoutAddress;
+    bool hasFanout;
 };
 
 }      // namespace specpaxos

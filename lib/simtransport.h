@@ -84,6 +84,8 @@ protected:
     LookupAddress(const specpaxos::Configuration &cfg, int idx);
     const SimulatedTransportAddress *
     LookupMulticastAddress(const specpaxos::Configuration *cfg);
+    const SimulatedTransportAddress *
+    LookupFanoutAddress(const specpaxos::Configuration *cfg);
     
 private:
     struct QueuedMessage {

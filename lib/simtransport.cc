@@ -159,6 +159,13 @@ SimulatedTransport::LookupAddress(const specpaxos::Configuration &cfg,
     Panic("No replica %d was registered", idx);
 }
 
+/* The fan-out node lives on another machine; there is nothing to simulate. */
+const SimulatedTransportAddress *
+SimulatedTransport::LookupFanoutAddress(const specpaxos::Configuration *cfg)
+{
+    return NULL;
+}
+
 const SimulatedTransportAddress *
 SimulatedTransport::LookupMulticastAddress(const specpaxos::Configuration *cfg)
 {

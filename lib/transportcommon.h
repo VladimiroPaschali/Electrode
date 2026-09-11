@@ -89,6 +89,28 @@ public:
             LookupAddresses();
         }
 
+#ifdef XDP_BROADCAST
+        // One packet to the fan-out node, which turns it into one per
+        // follower with XDP_CLONE_TX. The counterpart of TC_BROADCAST, where
+        // the leader also sends once and bpf_clone_redirect() makes the copies
+        // on its own egress path -- the difference being where the duplication
+        // happens, and therefore how many packets cross the wire.
+        //
+        // Nothing is marked in the payload. TC_BROADCAST sets the top bit of
+        // the view word, some ninety bytes into the frame; the fan-out node
+        // recognises the broadcast by the address it is sent to instead, which
+        // is the only thing reachable from a 64-byte WQE inline header and so
+        // the only thing the shared-page build could act on.
+        {
+            auto fkv = fanoutAddresses.find(cfg);
+            if (fkv == fanoutAddresses.end()) {
+                Panic("XDP_BROADCAST needs a 'fanout host:port' line in the "
+                      "configuration file");
+            }
+            return SendMessageInternal(src, fkv->second, m, false, my_buf);
+        }
+#endif
+
         auto kv = multicastAddresses.find(cfg);
         if (kv != multicastAddresses.end()) {
             // Send by multicast if we can
@@ -119,6 +141,8 @@ protected:
                                int replicaIdx) = 0;
     virtual const ADDR *
     LookupMulticastAddress(const specpaxos::Configuration *cfg) = 0;
+    virtual const ADDR *
+    LookupFanoutAddress(const specpaxos::Configuration *cfg) = 0;
 
     std::unordered_map<specpaxos::Configuration,
                        specpaxos::Configuration *> canonicalConfigs;
@@ -129,6 +153,7 @@ protected:
     std::map<const specpaxos::Configuration *,
              std::map<int, TransportReceiver *> > replicaReceivers;
     std::map<const specpaxos::Configuration *, ADDR> multicastAddresses;
+    std::map<const specpaxos::Configuration *, ADDR> fanoutAddresses;
     bool replicaAddressesInitialized;
 
     virtual specpaxos::Configuration *
@@ -171,6 +196,7 @@ protected:
         // Clear any existing list of addresses
         replicaAddresses.clear();
         multicastAddresses.clear();
+        fanoutAddresses.clear();
 
         // For every configuration, look up all addresses and cache
         // them.
@@ -187,6 +213,17 @@ protected:
                 const ADDR *addr = LookupMulticastAddress(cfg);
                 if (addr) {
                     multicastAddresses.insert(std::make_pair(cfg, *addr));
+                    delete addr;
+                }
+            }
+
+            // ...and a fan-out node. Unlike the multicast address, this one is
+            // never listened on locally: it belongs to another machine, which
+            // is the whole point.
+            if (cfg->fanout()) {
+                const ADDR *addr = LookupFanoutAddress(cfg);
+                if (addr) {
+                    fanoutAddresses.insert(std::make_pair(cfg, *addr));
                     delete addr;
                 }
             }

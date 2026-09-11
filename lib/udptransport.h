@@ -127,6 +127,8 @@ private:
                   int replicaIdx);
     const UDPTransportAddress *
     LookupMulticastAddress(const specpaxos::Configuration *cfg);
+    const UDPTransportAddress *
+    LookupFanoutAddress(const specpaxos::Configuration *cfg);
     void ListenOnMulticastPort(const specpaxos::Configuration
                                *canonicalConfig);
     void OnReadable(int fd);

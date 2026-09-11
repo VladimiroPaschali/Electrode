@@ -54,9 +54,14 @@ ReplicaAddress::operator==(const ReplicaAddress &other) const {
 
 
 Configuration::Configuration(const Configuration &c)
-    : n(c.n), f(c.f), replicas(c.replicas), hasMulticast(c.hasMulticast)
+    : n(c.n), f(c.f), replicas(c.replicas), hasMulticast(c.hasMulticast),
+      hasFanout(c.hasFanout)
 {
     multicastAddress = NULL;
+    fanoutAddress = NULL;
+    if (hasFanout) {
+        fanoutAddress = new ReplicaAddress(*c.fanoutAddress);
+    }
     if (hasMulticast) {
         multicastAddress = new ReplicaAddress(*c.multicastAddress);
     }
@@ -75,6 +80,8 @@ Configuration::Configuration(int n, int f,
         hasMulticast = false;
         multicastAddress = NULL;
     }
+    hasFanout = false;
+    fanoutAddress = NULL;
 }
 
 Configuration::Configuration(std::ifstream &file)
@@ -82,6 +89,8 @@ Configuration::Configuration(std::ifstream &file)
     f = -1;
     hasMulticast = false;
     multicastAddress = NULL;
+    hasFanout = false;
+    fanoutAddress = NULL;
     
     while (!file.eof()) {
         // Read a line
@@ -138,6 +147,21 @@ Configuration::Configuration(std::ifstream &file)
             multicastAddress = new ReplicaAddress(string(host),
                                                   string(port));
             hasMulticast = true;
+        } else if (strcasecmp(cmd, "fanout") == 0) {
+            char *arg = strtok(NULL, " \t");
+            if (!arg) {
+                Panic ("'fanout' configuration line requires an argument");
+            }
+
+            char *host = strtok(arg, ":");
+            char *port = strtok(NULL, "");
+
+            if (!host || !port) {
+                Panic("Configuration line format: 'fanout host:port'");
+            }
+
+            fanoutAddress = new ReplicaAddress(string(host), string(port));
+            hasFanout = true;
         } else {
             Panic("Unknown configuration directive: %s", cmd);
         }
@@ -155,6 +179,9 @@ Configuration::Configuration(std::ifstream &file)
 
 Configuration::~Configuration()
 {
+    if (hasFanout) {
+        delete fanoutAddress;
+    }
     if (hasMulticast) {
         delete multicastAddress;
     }
@@ -164,6 +191,16 @@ ReplicaAddress
 Configuration::replica(int idx) const
 {
     return replicas[idx];
+}
+
+const ReplicaAddress *
+Configuration::fanout() const
+{
+    if (hasFanout) {
+        return fanoutAddress;
+    } else {
+        return nullptr;
+    }
 }
 
 const ReplicaAddress *

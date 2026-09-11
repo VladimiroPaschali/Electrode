@@ -1,24 +1,26 @@
 #!/usr/bin/env bash
 # Check that each variant duplicates the broadcast where it claims to, rather
-# than quietly falling back to the baseline. Runs on maestrale.
+# than quietly falling back to the baseline. Runs on maestrale; the grecale half
+# is scripts/verify-node.sh.
 #
 #   ./verify.sh [variant ...]     default: all four
+#   sudo scripts/cluster.sh up 3  on grecale first
 #
-# What distinguishes them is not visible in the throughput, and three of the
-# four would produce a full set of plausible numbers if their offload silently
-# did nothing. Two counters settle it, both taken on the leader:
+# What distinguishes the four is not visible in the throughput, and three of
+# them would produce a full set of plausible numbers if their offload silently
+# did nothing. Two counters on the leader settle it:
 #
-#   UdpOutDatagrams   datagrams the leader's *userspace* handed to the stack
-#   frames on mv      what actually left its interface
+#   datagrams from userspace   what the replica handed to the stack
+#   frames on the wire         what actually left its interface
 #
-#   baseline    equal, and every frame is addressed to a follower
+#   baseline    equal, every frame addressed to a follower
 #   tc          more frames than datagrams: bpf_clone_redirect() made the
-#               difference, inside the egress path, below the IP counter
+#               difference inside the egress path, below the IP counter
 #   xdp*        equal, and the broadcast frames are addressed to the fan-out
-#               node -- one packet for the whole batch. The copies appear at
+#               node -- one packet for the whole batch. The copies show up at
 #               the followers, which is where they are counted.
 
-set -euo pipefail
+set -uo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(dirname "$here")
@@ -30,20 +32,30 @@ FANOUT_IP=${FANOUT_IP:-192.168.101.1}
 PORT=${PORT:-12345}
 REQUESTS=${REQUESTS:-3000}
 
+# Resolved as the login user: under sudo, $HOME is /root.
+REMOTE_ROOT=$(ssh "$GRECALE" "echo \$HOME/$REMOTE")
+
 variants=("$@")
 [ ${#variants[@]} -eq 0 ] && variants=(baseline tc xdp xdp-inline)
 
 fanout_pid=/tmp/electrode-verify.pid
 
 cleanup() {
-    ssh "$GRECALE" "sudo $REMOTE/scripts/node.sh stop" >/dev/null 2>&1 || true
-    [ -r "$fanout_pid" ] && { sudo kill -9 "$(cat "$fanout_pid")" 2>/dev/null || true; sudo rm -f "$fanout_pid"; }
-    local stale; stale=$(pgrep -x fanout || true)
-    [ -n "$stale" ] && sudo kill -9 $stale 2>/dev/null || true
-    sudo bpftool net detach xdp dev "$ETH" 2>/dev/null || true
+    ssh "$GRECALE" "sudo $REMOTE_ROOT/scripts/node.sh stop" >/dev/null 2>&1
+    if [ -r "$fanout_pid" ]; then
+        sudo kill -9 "$(cat "$fanout_pid")" 2>/dev/null
+        sudo rm -f "$fanout_pid"
+    fi
+    # By name, never by a -f pattern: that would match the shell that called us.
+    local stale
+    stale=$(pgrep -x fanout)
+    [ -n "$stale" ] && sudo kill -9 $stale 2>/dev/null
+    sudo bpftool net detach xdp dev "$ETH" 2>/dev/null
+    return 0
 }
 trap cleanup EXIT
 
+rc=0
 for v in "${variants[@]}"; do
     case "$v" in
         baseline|tc) cxx=$v;  object=fanout.bpf.o ;;
@@ -58,38 +70,21 @@ for v in "${variants[@]}"; do
         -c "$root/config.txt" -m "$root/config.macs" \
         -e "$(cat "$root/config.extra")" \
         > /tmp/electrode-verify.log 2>&1 < /dev/null &
-    for _ in $(seq 50); do grep -q '^ready' /tmp/electrode-verify.log && break; sleep 0.1; done
+    for _ in $(seq 50); do
+        grep -q '^ready' /tmp/electrode-verify.log && break
+        sleep 0.1
+    done
+    if ! grep -q '^ready' /tmp/electrode-verify.log; then
+        echo "the fan-out node did not come up:" >&2
+        cat /tmp/electrode-verify.log >&2
+        exit 1
+    fi
     awk '/^pid /{print $2}' /tmp/electrode-verify.log | sudo tee "$fanout_pid" >/dev/null
 
     echo "===== $v"
-    ssh "$GRECALE" "sudo bash -s" <<REMOTE_SH
-set -e
-cd \$HOME/$REMOTE
-[ "$v" = tc ] && ./scripts/node.sh start-tc 0 >/dev/null
-./scripts/node.sh start-replicas $cxx 3 >/dev/null
-sleep 1
-
-ip netns exec elec-r0 nstat -n >/dev/null 2>&1 || true
-ip netns exec elec-r0 timeout 20 tcpdump -i mv -nn -Q out -w /tmp/v-r0.pcap udp port $PORT >/dev/null 2>&1 &
-for i in 1 2; do
-    ip netns exec elec-r\$i timeout 20 tcpdump -i mv -nn -Q in -w /tmp/v-r\$i.pcap \
-        "udp port $PORT and src 192.168.101.10" >/dev/null 2>&1 &
-done
-sleep 1
-
-ip netns exec elec-cl ./build/$cxx/client -c config.txt -m vr -n $REQUESTS -t 4 -w 0 >/dev/null 2>&1
-sleep 1
-pkill -INT tcpdump 2>/dev/null || true
-sleep 1
-
-echo "  leader UdpOutDatagrams : \$(ip netns exec elec-r0 nstat -az UdpOutDatagrams | awk 'NR==2{print \$2}')"
-echo "  leader frames out      : \$(tcpdump -r /tmp/v-r0.pcap 2>/dev/null | wc -l)"
-echo "    of them to the fan-out node: \$(tcpdump -r /tmp/v-r0.pcap "dst host $FANOUT_IP" 2>/dev/null | wc -l)"
-echo "    of them to a follower      : \$(tcpdump -r /tmp/v-r0.pcap "dst host 192.168.101.11 or dst host 192.168.101.12" 2>/dev/null | wc -l)"
-for i in 1 2; do
-    echo "  follower \$i frames from leader: \$(tcpdump -r /tmp/v-r\$i.pcap 2>/dev/null | wc -l)"
-done
-./scripts/node.sh stop >/dev/null
-REMOTE_SH
+    ssh "$GRECALE" \
+        "sudo $REMOTE_ROOT/scripts/verify-node.sh $v $cxx $REQUESTS $FANOUT_IP $PORT" \
+        || { echo "  (failed)" >&2; rc=1; }
     echo
 done
+exit $rc

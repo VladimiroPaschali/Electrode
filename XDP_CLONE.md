@@ -160,6 +160,63 @@ should equal the reported median latency. Where it did not -- 1.23 to 1.45
 against 1.00 to 1.03 everywhere else -- the harness was the thing being
 measured.
 
+## What it measures
+
+216 runs, three repetitions each, three cluster sizes, one to thirty-two
+clients. Peak throughput, and the median latency at thirty-two clients:
+
+| replicas | baseline | Electrode (TC) | XDP_CLONE | XDP_CLONE inline |
+|---|---|---|---|---|
+| 3 | 45.9 kops | 51.4 (1.12x) | 59.3 (1.29x) | 59.8 (1.30x) |
+| 5 | 26.8 kops | 35.8 (1.34x) | 46.5 (1.74x) | 46.5 (1.73x) |
+| 7 | 18.4 kops | 28.9 (1.57x) | 37.2 (2.02x) | 37.5 (2.03x) |
+
+| replicas | baseline | Electrode (TC) | XDP_CLONE |
+|---|---|---|---|
+| 3 | 705 us | 626 | 532 |
+| 5 | 1212 us | 897 | 709 |
+| 7 | 1722 us | 1106 | 841 |
+
+The leader's core is the contended resource: it saturates at four to eight
+clients in every variant, and what separates them is how much of the broadcast
+it still has to do itself. Both offloads save it the same system calls -- one
+`sendmsg` instead of one per follower -- but TC then makes the copies **on that
+same core**, inside its own egress path, a full `dev_queue_xmit` each. XDP
+makes them on another machine. So the advantage of XDP over TC grows with the
+cluster: 1.15x at three replicas, 1.30x at five and seven.
+
+`xdp` and `xdp-inline` come out the same everywhere. That is expected here and
+is not a null result about the mechanism: see *Known limits*.
+
+Reproduce with:
+
+```bash
+scripts/sweep.sh --replicas 3 5 7 --threads 1 2 4 8 16 32 \
+                 --client-procs 4 --reps 3 --out results/e1.csv
+scripts/report.py results/e1.csv
+```
+
+## Checking that each variant does what it says
+
+Three of the four would produce a full set of plausible numbers if their
+offload silently did nothing, so `scripts/verify.sh` counts, on the leader, the
+datagrams userspace handed to the stack against the frames that actually left
+its interface, over 3000 requests:
+
+| variant | datagrams | frames on the wire | to the fan-out node | to a follower |
+|---|---|---|---|---|
+| baseline | 60060 | 59696 | 0 | 47758 |
+| tc | 36042 | **60076** | 0 | 48062 |
+| xdp | 36036 | 36039 | **24027** | 0 |
+| xdp-inline | 36039 | 36042 | **24029** | 0 |
+
+The baseline's two counts agree: one frame per datagram, all of them addressed
+to a follower. The TC point sends 40% fewer datagrams and puts **more** frames
+on the wire than it sent -- the difference is `bpf_clone_redirect()` working
+below the IP counter. The XDP points send the same 40% fewer datagrams and put
+exactly that many frames on the wire, addressed to the fan-out node; both
+followers still receive their 24027, which were made there.
+
 ## Known limits
 
 - **Namespaces, not machines.** The replicas share grecale's CPU, so the

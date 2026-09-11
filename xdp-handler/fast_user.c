@@ -1,360 +1,367 @@
 /*
- *  Software Name : bmc-cache
- *  SPDX-FileCopyrightText: Copyright (c) 2021 Orange
+ *  Software Name : fast-paxos
+ *  SPDX-FileCopyrightText: Copyright (c) 2022 Orange
  *  SPDX-License-Identifier: LGPL-2.1-only
  *
  *  This software is distributed under the
  *  GNU Lesser General Public License v2.1 only.
  *
- *  Author: Yoann GHIGOFF <yoann.ghigoff@orange.com> et al.
+ *  Author: asd123www <wzz@pku.edu.cn> et al.
+ *
+ *  XDP_CLONE: ported from the libbpf that shipped inside a kernel-5.8 source
+ *  tree to the distribution's libbpf 1.x. What went away with 1.0 and what
+ *  stands in for it:
+ *
+ *    bpf_object__find_program_by_title()  ->  ..._by_name(), so programs are
+ *                                             looked up by function name
+ *    bpf_object__load_xattr()             ->  bpf_object__load()
+ *    bpf_program__pin_instance()          ->  bpf_program__pin()
+ *    bpf_set_link_xdp_fd()                ->  bpf_xdp_attach()
+ *    tc(8) called through system()        ->  bpf_tc_hook_create/bpf_tc_attach
+ *
+ *  The replica MAC addresses were hardcoded in this file; they now come from a
+ *  text file, one per replica, in the order of config.txt.
  */
 
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <string.h>
-#include <signal.h>
-#include <time.h>
 #include <assert.h>
 #include <errno.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/resource.h>
-#include <asm-generic/posix_types.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <linux/if_link.h>
 #include <linux/limits.h>
 
-#include <linux/bpf.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
 #include "fast_common.h"
 
-#define BPF_SYSFS_ROOT "/sys/fs/bpf"
+static const char *ifname;
+static const char *config_path = "../config.txt";
+static const char *macs_path = "../config.macs";
+static int leader_idx = 0;
 
+static int ifindex;
+static struct bpf_object *obj;
+static struct bpf_tc_hook tc_hook;
+static struct bpf_tc_opts tc_opts;
+static int tc_attached;
 
-struct bpf_progs_desc {
-	char name[256];
-	enum bpf_prog_type type;
-	unsigned char pin;
-	int map_prog_idx;
-	struct bpf_program *prog;
+#ifdef ELECTRODE_XDP_OFFLOADS
+static int xdp_attached;
+#endif
+
+/* Same layout as the map value in fast_kern.c. */
+struct paxos_ctr_state {
+	enum ReplicaStatus state;
+	int myIdx, leaderIdx, batchSize;
+	__u64 view, lastOp;
 };
-// define our eBPF program.
-static struct bpf_progs_desc progs[] = {
-	{"fastPaxos", BPF_PROG_TYPE_XDP, 0, -1, NULL},
-	{"HandlePrepare", BPF_PROG_TYPE_XDP, 0, FAST_PROG_XDP_HANDLE_PREPARE, NULL},
-	{"HandlePrepareOK", BPF_PROG_TYPE_XDP, 0, FAST_PROG_XDP_HANDLE_PREPAREOK, NULL},
-	{"HandleRequest", BPF_PROG_TYPE_XDP, 0, FAST_PROG_XDP_HANDLE_REQUEST, NULL},
-	{"WriteBuffer", BPF_PROG_TYPE_XDP, 0, FAST_PROG_XDP_WRITE_BUFFER, NULL},
-	{"PrepareFastReply", BPF_PROG_TYPE_XDP, 0, FAST_PROG_XDP_PREPARE_REPLY, NULL},
 
-	{"FastBroadCast", BPF_PROG_TYPE_SCHED_CLS, 1, -1, NULL},
-};
+static void usage(const char *argv0) {
+	fprintf(stderr,
+	        "usage: %s <ifname> [-c config.txt] [-m macs.txt] [-l leaderIdx]\n"
+	        "\n"
+	        "  -c  replica list, Electrode's own config.txt format\n"
+	        "  -m  one MAC address per line, in the order of that file\n"
+	        "  -l  index of the leader replica (default 0)\n",
+	        argv0);
+	exit(EXIT_FAILURE);
+}
 
+static void parse_cmdline(int argc, char *argv[]) {
+	int opt;
 
-struct bpf_object *obj;
-struct bpf_object_load_attr load_attr;
-int err, prog_count;
-int xdp_main_prog_fd;
-char filename[PATH_MAX];
-char commandname[PATH_MAX];
-__u32 xdp_flags = 0;
-int *interfaces_idx;
+	if (argc < 2 || argv[1][0] == '-')
+		usage(argv[0]);
+	ifname = argv[1];
 
-int map_progs_fd, map_progs_xdp_fd, map_progs_tc_fd, map_paxos_ctr_state_fd;
-int map_prepare_buffer_fd, map_configure_fd, map_request_buffer_fd;
-int interface_count = 0;
-static int nr_cpus = 0;
+	optind = 2;
+	while ((opt = getopt(argc, argv, "c:m:l:")) != -1) {
+		switch (opt) {
+		case 'c': config_path = optarg; break;
+		case 'm': macs_path = optarg; break;
+		case 'l': leader_idx = atoi(optarg); break;
+		default: usage(argv[0]);
+		}
+	}
 
+	ifindex = if_nametoindex(ifname);
+	if (!ifindex) {
+		fprintf(stderr, "Error: no interface %s\n", ifname);
+		exit(EXIT_FAILURE);
+	}
+}
 
-void parse_cmdline(int argc, char *argv[]) {
-	snprintf(filename, sizeof(filename), "%s_kern.o", argv[0]);
+/* config.txt is Electrode's own:
+ *
+ *     f <number of failures tolerated>
+ *     replica <host>:<port>
+ *     ...
+ *
+ * and the MAC file carries one address per line in the same order. Both are
+ * read here so that the eBPF side agrees with the replicas on who is who.
+ */
+static void read_config(void) {
+	int map_fd = bpf_object__find_map_fd_by_name(obj, "map_configure");
+	FILE *fp, *fm = NULL;
+	char buff[256];
+	int f = 0, n;
 
-	interface_count = argc - optind;
-	if (interface_count <= 0) {
-		fprintf(stderr, "Missing at least one required interface index\n");
+	if (map_fd < 0) {
+		fprintf(stderr, "Error: no map_configure in the object\n");
 		exit(EXIT_FAILURE);
 	}
 
-	interfaces_idx = calloc(sizeof(int), interface_count);
-	if (interfaces_idx == NULL) {
-		fprintf(stderr, "Error: failed to allocate memory\n");
-		exit(1); // return 1;
+	fp = fopen(config_path, "r");
+	if (!fp) {
+		fprintf(stderr, "Error: cannot open %s: %s\n", config_path, strerror(errno));
+		exit(EXIT_FAILURE);
 	}
-
-	for (int i = 0; i < interface_count && optind < argc; i++) {
-		// printf("%d\n", if_nametoindex(argv[optind]));
-		interfaces_idx[i] = if_nametoindex(argv[optind + i]);
-	}
-
-	// asd123www: XDP_FLAGS_DRV_MODE not supported! use XDP_FLAGS_SKB_MODE.
-	xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST | XDP_FLAGS_DRV_MODE;
-	nr_cpus = libbpf_num_possible_cpus();
-}
-
-
-void create_object() {
-	obj = bpf_object__open(filename);
-	if (!obj) {
-		fprintf(stderr, "Error: bpf_object__open failed\n");
-		exit(1); //return 1;
-	}
-
-	prog_count = sizeof(progs) / sizeof(progs[0]);
-	for (int i = 0; i < prog_count; i++) {
-		printf("progname: %s\n", progs[i].name);
-		progs[i].prog = bpf_object__find_program_by_title(obj, progs[i].name);
-		if (!progs[i].prog) {
-			fprintf(stderr, "Error: bpf_object__find_program_by_title failed\n");
-			exit(1); //return 1;
-		}
-		bpf_program__set_type(progs[i].prog, progs[i].type);
-	}
-	
-	load_attr.obj = obj;
-	load_attr.log_level = LIBBPF_WARN;
-
-	/* Load/unload object into/from kernel */
-	err = bpf_object__load_xattr(&load_attr);
-	if (err) {
-		fprintf(stderr, "Error: bpf_object__load_xattr failed\n");
-		exit(1); //return 1;
-	}
-	map_progs_xdp_fd = bpf_object__find_map_fd_by_name(obj, "map_progs_xdp");
-	if (map_progs_xdp_fd < 0) {
-		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name failed\n");
-		exit(1); //return 1;
-	}
-	map_progs_tc_fd = bpf_object__find_map_fd_by_name(obj, "map_progs_tc");
-	if (map_progs_tc_fd < 0) {
-		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name failed\n");
-		exit(1);
-		// return 1;
-	}
-
-
-	map_prepare_buffer_fd = bpf_object__find_map_fd_by_name(obj, "map_prepare_buffer");
-	if (map_prepare_buffer_fd < 0) {
-		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name failed\n");
-		exit(1); //return 1;
-	}
-	map_request_buffer_fd = bpf_object__find_map_fd_by_name(obj, "map_request_buffer");
-	if (map_request_buffer_fd < 0) {
-		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name failed\n");
-		exit(1); //return 1;
-	}
-	map_paxos_ctr_state_fd = bpf_object__find_map_fd_by_name(obj, "map_ctr_state");
-	if (map_paxos_ctr_state_fd < 0) {
-		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name failed\n");
-		exit(1); //return 1;
-	}
-}
-
-void initial_prog_map () {
-	for (int i = 0; i < prog_count; i++) {
-		int prog_fd = bpf_program__fd(progs[i].prog);
-
-		if (prog_fd < 0) {
-			fprintf(stderr, "Error: Couldn't get file descriptor for program %s\n", progs[i].name);
-			exit(1); //return 1;
-		}
-
-		if (progs[i].map_prog_idx != -1) {
-			unsigned int map_prog_idx = progs[i].map_prog_idx;
-			if (map_prog_idx < 0) {
-				fprintf(stderr, "Error: Cannot get prog fd for bpf program %s\n", progs[i].name);
-				exit(1); //return 1;
-			}
-
-			switch (progs[i].type) {
-			case BPF_PROG_TYPE_XDP:
-				map_progs_fd = map_progs_xdp_fd;
-				break;
-			case BPF_PROG_TYPE_SCHED_CLS:
-				map_progs_fd = map_progs_tc_fd;
-				break;
-			default:
-				fprintf(stderr, "Error: Program type doesn't correspond to any prog array map\n");
-				exit(1); //return 1;
-			}
-
-			// update map in bpf_tail_call, e.g. f[idx] = fd.
-			err = bpf_map_update_elem(map_progs_fd, &map_prog_idx, &prog_fd, 0);
-			if (err) {
-				fprintf(stderr, "Error: bpf_map_update_elem failed for prog array map\n");
-				exit(1); // return 1;
-			}
-		}
-
-		if (progs[i].pin) {
-			int len = snprintf(filename, PATH_MAX, "%s/%s", BPF_SYSFS_ROOT, progs[i].name);
-			if (len < 0) {
-				fprintf(stderr, "Error: Program name '%s' is invalid\n", progs[i].name);
-				exit(-1); // return -1;
-			} else if (len >= PATH_MAX) {
-				fprintf(stderr, "Error: Program name '%s' is too long\n", progs[i].name);
-				exit(-1); // return -1;
-			}
-retry:
-			if (bpf_program__pin_instance(progs[i].prog, filename, 0)) {
-				fprintf(stderr, "Error: Failed to pin program '%s' to path %s\n", progs[i].name, filename);
-				if (errno == EEXIST) {
-					fprintf(stdout, "BPF program '%s' already pinned, unpinning it to reload it\n", progs[i].name);
-					if (bpf_program__unpin_instance(progs[i].prog, filename, 0)) {
-						fprintf(stderr, "Error: Fail to unpin program '%s' at %s\n", progs[i].name, filename);
-						exit(-1);
-						// return -1;
-					}
-					goto retry;
-				}
-				exit(-1);
-				// return -1;
-			}
-		}
-	}
-
-	xdp_main_prog_fd = bpf_program__fd(progs[0].prog);
-	if (xdp_main_prog_fd < 0) {
-		fprintf(stderr, "Error: bpf_program__fd failed\n");
-		exit(1); // return 1;
-	}
-}
-
-void add_interrupt() {
-	/* asd123www: 
-		!!!!!! the user-space program shouldn't quit here.
-				Otherwise the program will be lost, due to fd lost???
-	*/
-	sigset_t signal_mask;
-	sigemptyset(&signal_mask);
-	sigaddset(&signal_mask, SIGINT);
-	sigaddset(&signal_mask, SIGTERM);
-	sigaddset(&signal_mask, SIGUSR1);
-
-	int sig, cur_poll_count = 0, quit = 0;
-	// FILE *fp = NULL;
-
-	err = sigprocmask(SIG_BLOCK, &signal_mask, NULL);
-	if (err != 0) {
-		fprintf(stderr, "Error: Failed to set signal mask\n");
+	fm = fopen(macs_path, "r");
+	if (!fm) {
+		fprintf(stderr, "Error: cannot open %s: %s\n", macs_path, strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 
-	while (!quit) {
-		err = sigwait(&signal_mask, &sig);
-		if (err != 0) {
-			fprintf(stderr, "Error: Failed to wait for signal\n");
+	if (fscanf(fp, "%255s", buff) != 1 || strcmp(buff, "f") != 0 ||
+	    fscanf(fp, "%d", &f) != 1) {
+		fprintf(stderr, "Error: %s does not start with 'f <n>'\n", config_path);
+		exit(EXIT_FAILURE);
+	}
+
+	n = 2 * f + 1;
+	if (n > FAST_REPLICA_MAX) {
+		fprintf(stderr, "Error: %d replicas, at most %d\n", n, FAST_REPLICA_MAX);
+		exit(EXIT_FAILURE);
+	}
+	if (n != CLUSTER_SIZE) {
+		fprintf(stderr,
+		        "Error: %s describes %d replicas but this object was built with "
+		        "CLUSTER_SIZE=%d. Rebuild with EXTRA_CFLAGS=-DCLUSTER_SIZE=%d.\n",
+		        config_path, n, CLUSTER_SIZE, n);
+		exit(EXIT_FAILURE);
+	}
+
+	for (int i = 0; i < n; ++i) {
+		struct paxos_configure conf;
+		struct sockaddr_in sa;
+		unsigned int eth[ETH_ALEN];
+		char *ipv4, *port;
+
+		if (fscanf(fp, "%255s", buff) != 1 || strcmp(buff, "replica") != 0 ||
+		    fscanf(fp, "%255s", buff) != 1) {
+			fprintf(stderr, "Error: %s: replica %d is missing\n", config_path, i);
+			exit(EXIT_FAILURE);
+		}
+		ipv4 = strtok(buff, ":");
+		port = strtok(NULL, ":");
+		if (!ipv4 || !port) {
+			fprintf(stderr, "Error: %s: replica %d is not host:port\n", config_path, i);
+			exit(EXIT_FAILURE);
+		}
+		if (inet_pton(AF_INET, ipv4, &sa.sin_addr) != 1) {
+			fprintf(stderr, "Error: %s: replica %d has no IPv4 address (%s)\n",
+			        config_path, i, ipv4);
 			exit(EXIT_FAILURE);
 		}
 
-		switch (sig) {
-			case SIGINT:
-			case SIGTERM:
-				quit = 1;
-				break;
-
-			default:
-				fprintf(stderr, "Unknown signal\n");
-				break;
+		if (fscanf(fm, "%x:%x:%x:%x:%x:%x", &eth[0], &eth[1], &eth[2], &eth[3],
+		           &eth[4], &eth[5]) != 6) {
+			fprintf(stderr, "Error: %s: no MAC for replica %d\n", macs_path, i);
+			exit(EXIT_FAILURE);
 		}
-	}
-	return;
-}
 
-void read_config() {
-	map_configure_fd = bpf_object__find_map_fd_by_name(obj, "map_configure");
-	if (map_configure_fd < 0) {
-		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name failed\n");
-		exit(1); //return 1;
-	}
-
-	FILE *fp;
-	char buff[255];
-	int f = 0, port = 0;
-
-	struct sockaddr_in sa;
-	char str[INET_ADDRSTRLEN];
-	struct paxos_configure conf;
-
-	const char *eths[FAST_REPLICA_MAX] = {"9c:dc:71:56:8f:45",
-										"9c:dc:71:56:bf:45", 
-										"9c:dc:71:5e:2f:51", 
-										"", 
-										""}; 
-
-	fp = fopen("../config.txt", "r");
-	fscanf(fp, "%s", buff); // must be 'f'
-	fscanf(fp, "%d", &f);
-	for (int i = 0; i < 2*f + 1; ++i) {
-		fscanf(fp, "%s", buff); // must be 'replica'
-		fscanf(fp, "%s", buff);
-
-		char *ipv4 = strtok(buff, ":");
-		assert(ipv4 != NULL);
-		char *port = strtok(NULL, ":");
-
-		// store this IP address in sa:
-		inet_pton(AF_INET, ipv4, &(sa.sin_addr));
-		// now get it back and print it
-		inet_ntop(AF_INET, &(sa.sin_addr), str, INET_ADDRSTRLEN);
-		conf.port = htons(atoi(port));
+		memset(&conf, 0, sizeof(conf));
 		conf.addr = sa.sin_addr.s_addr;
-		sscanf(eths[i], "%x:%x:%x:%x:%x:%x", conf.eth, conf.eth + 1, conf.eth + 2, conf.eth + 3, conf.eth + 4, conf.eth + 5);
-		err = bpf_map_update_elem(map_configure_fd, &i, &conf, 0);
+		conf.port = htons(atoi(port));
+		for (int j = 0; j < ETH_ALEN; ++j)
+			conf.eth[j] = (char)eth[j];
+
+		if (bpf_map_update_elem(map_fd, &i, &conf, 0)) {
+			fprintf(stderr, "Error: map_configure[%d]: %s\n", i, strerror(errno));
+			exit(EXIT_FAILURE);
+		}
+		printf("replica %d  %s:%s  %02x:%02x:%02x:%02x:%02x:%02x%s\n", i, ipv4, port,
+		       eth[0], eth[1], eth[2], eth[3], eth[4], eth[5],
+		       i == leader_idx ? "  (leader)" : "");
 	}
 
 	fclose(fp);
-	return;
+	fclose(fm);
+}
+
+/* FastBroadCast reads leaderIdx out of this map to know which replica to skip.
+ * Upstream it is written by the replica's ModifyKernelState(), which only runs
+ * with FAST_REPLY / FAST_QUORUM_PRUNE / FAST_BATCH compiled in. With the
+ * broadcast offload alone nothing would ever write it, so it is seeded here.
+ */
+static void seed_ctr_state(void) {
+	int map_fd = bpf_object__find_map_fd_by_name(obj, "map_ctr_state");
+	struct paxos_ctr_state st;
+	__u32 key = 0;
+
+	if (map_fd < 0) {
+		fprintf(stderr, "Error: no map_ctr_state in the object\n");
+		exit(EXIT_FAILURE);
+	}
+
+	memset(&st, 0, sizeof(st));
+	st.state = STATUS_NORMAL;
+	st.leaderIdx = leader_idx;
+	st.myIdx = leader_idx;
+
+	if (bpf_map_update_elem(map_fd, &key, &st, 0)) {
+		fprintf(stderr, "Error: map_ctr_state: %s\n", strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+}
+
+static void detach(void) {
+	if (tc_attached) {
+		tc_opts.flags = tc_opts.prog_fd = tc_opts.prog_id = 0;
+		bpf_tc_detach(&tc_hook, &tc_opts);
+		/* Leave the clsact qdisc alone if something else put it there. */
+		bpf_tc_hook_destroy(&tc_hook);
+		tc_attached = 0;
+	}
+#ifdef ELECTRODE_XDP_OFFLOADS
+	if (xdp_attached) {
+		bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		xdp_attached = 0;
+	}
+#endif
+}
+
+static void on_signal(int sig) {
+	(void)sig;
+	detach();
+	printf("\ndetached, quitting safely\n");
+	exit(0);
 }
 
 int main(int argc, char *argv[]) {
+	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
+	struct bpf_program *tc_prog;
+	char objname[PATH_MAX];
+	int err;
 
 	parse_cmdline(argc, argv);
-	create_object();
-	initial_prog_map();
-	read_config();
+	setrlimit(RLIMIT_MEMLOCK, &r);
 
-	assert(bpf_obj_pin(map_prepare_buffer_fd, "/sys/fs/bpf/paxos_prepare_buffer") == 0);
-	assert(bpf_obj_pin(map_request_buffer_fd, "/sys/fs/bpf/paxos_request_buffer") == 0);
-	assert(bpf_obj_pin(map_paxos_ctr_state_fd, "/sys/fs/bpf/paxos_ctr_state") == 0);
+	snprintf(objname, sizeof(objname), "%s_kern.o", argv[0]);
+	obj = bpf_object__open(objname);
+	if (!obj) {
+		fprintf(stderr, "Error: cannot open %s: %s\n", objname, strerror(errno));
+		return 1;
+	}
 
-	for (int i = 0; i < interface_count; i++) {
-		if (bpf_set_link_xdp_fd(interfaces_idx[i], xdp_main_prog_fd, xdp_flags) < 0) {
-			fprintf(stderr, "Error: bpf_set_link_xdp_fd failed for interface %d\n", interfaces_idx[i]);
+	/* SEC("FastBroadCast") is not a name libbpf knows, so the type has to be
+	 * set by hand before the load -- as it was upstream.
+	 */
+	tc_prog = bpf_object__find_program_by_name(obj, "FastBroadCast_main");
+	if (!tc_prog) {
+		fprintf(stderr, "Error: no FastBroadCast_main in %s\n", objname);
+		return 1;
+	}
+	bpf_program__set_type(tc_prog, BPF_PROG_TYPE_SCHED_CLS);
+
+#ifdef ELECTRODE_XDP_OFFLOADS
+	static const char *xdp_names[] = {
+	    "fastPaxos_main",      "HandlePrepare_main",  "HandlePrepareOK_main",
+	    "HandleRequest_main",  "WriteBuffer_main",    "PrepareFastReply_main",
+	};
+	struct bpf_program *xdp_progs[sizeof(xdp_names) / sizeof(xdp_names[0])];
+
+	for (size_t i = 0; i < sizeof(xdp_names) / sizeof(xdp_names[0]); i++) {
+		xdp_progs[i] = bpf_object__find_program_by_name(obj, xdp_names[i]);
+		if (!xdp_progs[i]) {
+			fprintf(stderr, "Error: no %s in %s\n", xdp_names[i], objname);
 			return 1;
-		} else {
-			printf("Main BPF program attached to XDP on interface %d\n", interfaces_idx[i]);
 		}
+		bpf_program__set_type(xdp_progs[i], BPF_PROG_TYPE_XDP);
+	}
+#endif
+
+	if ((err = bpf_object__load(obj))) {
+		fprintf(stderr, "Error: load failed: %s\n", strerror(-err));
+		return 1;
 	}
 
-	for (int i = 0; i < interface_count && optind < argc; i++) {
-		snprintf(commandname, PATH_MAX, "tc qdisc add dev %s clsact", argv[optind + i]);
-		assert(system(commandname) == 0);
-		snprintf(commandname, PATH_MAX, "tc filter add dev %s egress bpf object-pinned /sys/fs/bpf/FastBroadCast", argv[optind + i]);
-		assert(system(commandname) == 0);
-		printf("Main BPF program attached to TC on interface %d\n", interfaces_idx[i]);
+	read_config();
+	seed_ctr_state();
+
+#ifdef ELECTRODE_XDP_OFFLOADS
+	{
+		int map_xdp = bpf_object__find_map_fd_by_name(obj, "map_progs_xdp");
+		static const int idx[] = {-1, FAST_PROG_XDP_HANDLE_PREPARE,
+		                          FAST_PROG_XDP_HANDLE_PREPAREOK,
+		                          FAST_PROG_XDP_HANDLE_REQUEST,
+		                          FAST_PROG_XDP_WRITE_BUFFER,
+		                          FAST_PROG_XDP_PREPARE_REPLY};
+
+		for (size_t i = 1; i < sizeof(idx) / sizeof(idx[0]); i++) {
+			int fd = bpf_program__fd(xdp_progs[i]);
+			__u32 k = idx[i];
+
+			if (bpf_map_update_elem(map_xdp, &k, &fd, 0)) {
+				fprintf(stderr, "Error: map_progs_xdp[%u]: %s\n", k, strerror(errno));
+				return 1;
+			}
+		}
+
+		assert(bpf_obj_pin(bpf_object__find_map_fd_by_name(obj, "map_prepare_buffer"),
+		                   "/sys/fs/bpf/paxos_prepare_buffer") == 0);
+		assert(bpf_obj_pin(bpf_object__find_map_fd_by_name(obj, "map_request_buffer"),
+		                   "/sys/fs/bpf/paxos_request_buffer") == 0);
+		assert(bpf_obj_pin(bpf_object__find_map_fd_by_name(obj, "map_ctr_state"),
+		                   "/sys/fs/bpf/paxos_ctr_state") == 0);
+
+		if (bpf_xdp_attach(ifindex, bpf_program__fd(xdp_progs[0]),
+		                   XDP_FLAGS_DRV_MODE, NULL)) {
+			fprintf(stderr, "Error: XDP attach on %s: %s\n", ifname, strerror(errno));
+			return 1;
+		}
+		xdp_attached = 1;
+		printf("XDP attached to %s\n", ifname);
+	}
+#endif
+
+	signal(SIGINT, on_signal);
+	signal(SIGTERM, on_signal);
+
+	memset(&tc_hook, 0, sizeof(tc_hook));
+	tc_hook.sz = sizeof(tc_hook);
+	tc_hook.ifindex = ifindex;
+	tc_hook.attach_point = BPF_TC_EGRESS;
+
+	err = bpf_tc_hook_create(&tc_hook);
+	if (err && err != -EEXIST) {
+		fprintf(stderr, "Error: clsact on %s: %s\n", ifname, strerror(-err));
+		return 1;
 	}
 
-	add_interrupt();
-	assert(remove("/sys/fs/bpf/paxos_prepare_buffer") == 0);
-	assert(remove("/sys/fs/bpf/paxos_request_buffer") == 0);
-	assert(remove("/sys/fs/bpf/paxos_ctr_state") == 0);
-
-	for (int i = 0; i < interface_count; i++) {
-		bpf_set_link_xdp_fd(interfaces_idx[i], -1, xdp_flags);
+	memset(&tc_opts, 0, sizeof(tc_opts));
+	tc_opts.sz = sizeof(tc_opts);
+	tc_opts.prog_fd = bpf_program__fd(tc_prog);
+	if ((err = bpf_tc_attach(&tc_hook, &tc_opts))) {
+		fprintf(stderr, "Error: TC egress attach on %s: %s\n", ifname, strerror(-err));
+		return 1;
 	}
-	for (int i = 0; i < interface_count && optind < argc; i++) {
-		snprintf(commandname, PATH_MAX, "tc filter del dev %s egress", argv[optind + i]);
-		assert(system(commandname) == 0);
-		snprintf(commandname, PATH_MAX, "tc qdisc del dev %s clsact", argv[optind + i]);
-		assert(system(commandname) == 0);
-	}
-	assert(system("rm -f /sys/fs/bpf/FastBroadCast") == 0);
-	printf("\nasd123www: quit safely!\n");
+	tc_attached = 1;
+	printf("FastBroadCast attached to TC egress on %s\n", ifname);
+	printf("ready\n");
+	fflush(stdout);
 
+	pause();
+	detach();
 	return 0;
 }
-
-// gcc -g -O2 -Wall -DKBUILD_MODNAME="\"wzz\"" -I. -I./linux/tools/lib -I./linux/tools/include/uapi  -o test fast_test.c ./linux/tools/lib/bpf/libbpf.a -L./linux/tools/lib/bpf -l:libbpf.a -lelf  -lz

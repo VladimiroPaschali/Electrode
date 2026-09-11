@@ -14,7 +14,24 @@
 #include <linux/ip.h>
 #include <linux/udp.h>
 #include <linux/tcp.h>
-#include "linux/tools/lib/bpf/bpf_helpers.h"
+/* XDP_CLONE: the distribution's libbpf headers, instead of the copy inside a
+ * kernel-5.8 source tree that kernel-src-download.sh used to fetch.
+ */
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+#include <linux/pkt_cls.h>
+#include <linux/in.h>
+
+/* Spellings the kernel-tree build got from its own headers. */
+#ifndef memcpy
+#define memcpy(dst, src, n) __builtin_memcpy((dst), (src), (n))
+#endif
+#ifndef htons
+#define htons(x) bpf_htons(x)
+#endif
+#ifndef ntohs
+#define ntohs(x) bpf_ntohs(x)
+#endif
 
 #include "fast_common.h"
 
@@ -30,25 +47,27 @@
  */
 
 /* program maps */
-struct bpf_map_def SEC("maps") map_progs_xdp = {
-	.type = BPF_MAP_TYPE_PROG_ARRAY,
-	.key_size = sizeof(__u32),
-	.value_size = sizeof(__u32),
-	.max_entries = FAST_PROG_XDP_MAX,
-};
-struct bpf_map_def SEC("maps") map_progs_tc = {
-	.type = BPF_MAP_TYPE_PROG_ARRAY,
-	.key_size = sizeof(__u32),
-	.value_size = sizeof(__u32),
-	.max_entries = FAST_PROG_TC_MAX,
-};
+#ifdef ELECTRODE_XDP_OFFLOADS
+struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, FAST_PROG_XDP_MAX);
+} map_progs_xdp SEC(".maps");
+#endif
+struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, FAST_PROG_TC_MAX);
+} map_progs_tc SEC(".maps");
 
-struct bpf_map_def SEC("maps") map_configure = {
-	.type = BPF_MAP_TYPE_ARRAY,
-	.key_size = sizeof(__u32),
-	.value_size = sizeof(struct paxos_configure),
-	.max_entries = FAST_REPLICA_MAX,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct paxos_configure);
+	__uint(max_entries, FAST_REPLICA_MAX);
+} map_configure SEC(".maps");
 
 // control state, only changes in user-space(except lastOp).
 struct paxos_ctr_state {
@@ -56,18 +75,20 @@ struct paxos_ctr_state {
 	int myIdx, leaderIdx, batchSize; // it's easier to maintain in user-space.
 	__u64 view, lastOp;
 };
-struct bpf_map_def SEC("maps") map_ctr_state = {
-	.type = BPF_MAP_TYPE_ARRAY,
-	.key_size = sizeof(__u32),
-	.value_size = sizeof(struct paxos_ctr_state),
-	.max_entries = 1,
-};
-struct bpf_map_def SEC("maps") map_msg_lastOp = {
-	.type = BPF_MAP_TYPE_ARRAY,
-	.key_size = sizeof(__u32),
-	.value_size = sizeof(__u64),
-	.max_entries = 1,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct paxos_ctr_state);
+	__uint(max_entries, 1);
+} map_ctr_state SEC(".maps");
+#ifdef ELECTRODE_XDP_OFFLOADS
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(max_entries, 1);
+} map_msg_lastOp SEC(".maps");
+#endif
 
 
 struct paxos_quorum {
@@ -82,26 +103,27 @@ struct {
 
 
 
+#ifdef ELECTRODE_XDP_OFFLOADS
 struct paxos_batch {
 	__u32 counter;
 	struct bpf_spin_lock lock;
 };
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__type(key, u32);
+	__type(key, __u32);
 	__type(value, struct paxos_batch);
 	__uint(max_entries, 1);
 } batch_context SEC(".maps");
 
-
-struct bpf_map_def SEC("maps") map_prepare_buffer = {
-    .type = BPF_MAP_TYPE_RINGBUF,
-    .max_entries = 1<<20,
-};
-struct bpf_map_def SEC("maps") map_request_buffer = {
-    .type = BPF_MAP_TYPE_RINGBUF,
-    .max_entries = 1<<20,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 1 << 20);
+} map_prepare_buffer SEC(".maps");
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 1 << 20);
+} map_request_buffer SEC(".maps");
+#endif
 
 
 static inline __u16 compute_ip_checksum(struct iphdr *ip) {
@@ -144,6 +166,8 @@ static inline int compute_message_type(char *payload, void *data_end) {
 	}
 	return -1;
 }
+
+#ifdef ELECTRODE_XDP_OFFLOADS
 
 SEC("fastPaxos")
 int fastPaxos_main(struct xdp_md *ctx) {
@@ -420,6 +444,8 @@ int PrepareFastReply_main(struct xdp_md *ctx) {
 	return XDP_TX;
 }
 
+
+#endif /* ELECTRODE_XDP_OFFLOADS */
 
 SEC("FastBroadCast")
 int FastBroadCast_main(struct __sk_buff *skb) {

@@ -3,12 +3,12 @@
 #
 
 
-# asd123www: add libbpf flags
-LINUX_PATH ?= ./xdp-handler/linux
-LINUX_TOOLS_PATH = $(LINUX_PATH)/tools
-LINUX_LIB_PATH = $(LINUX_TOOLS_PATH)/lib
-LIBBPF_PATH = $(LINUX_LIB_PATH)/bpf
-LIBBPF = $(LIBBPF_PATH)/libbpf.a
+# XDP_CLONE: build against the distribution's libbpf instead of the copy the
+# upstream Makefile expected inside a kernel-5.8 source tree. Nothing here uses
+# anything newer than libbpf 0.x, and this removes the kernel-src-download.sh
+# step entirely.
+LIBBPF_CFLAGS := $(shell pkg-config --cflags libbpf)
+LIBBPF_LDFLAGS := $(shell pkg-config --libs libbpf)
 
 CC = gcc
 CXX = g++
@@ -16,13 +16,12 @@ LD = g++
 
 CFLAGS := -DNASSERT -O2 -g -Wall -pthread -iquote.obj/gen -Wno-uninitialized
 CFLAGS += -I.
-CFLAGS += -I$(LINUX_LIB_PATH)
-CFLAGS += -I$(LINUX_TOOLS_PATH)/include/uapi
+CFLAGS += $(LIBBPF_CFLAGS)
 CFLAGS += -Wno-unused-variable
 
 # CXXFLAGS := -std=c++0x
-override CXXFLAGS += -std=c++0x
-LDFLAGS := -levent_pthreads -ldl   -L$(LIBBPF_PATH) -l:libbpf.a -lelf $(USER_LIBS) -lz
+override CXXFLAGS += -std=c++14
+LDFLAGS := -levent_pthreads -ldl $(LIBBPF_LDFLAGS) -lelf $(USER_LIBS) -lz
 ## Debian package: check
 # CHECK_CFLAGS := $(shell pkg-config --cflags check)
 # CHECK_LDFLAGS := $(shell pkg-config --cflags --libs check)
@@ -149,8 +148,10 @@ include vr/Rules.mk
 include fastpaxos/Rules.mk
 include spec/Rules.mk
 include bench/Rules.mk
-include nistore/Rules.mk
-include timeserver/Rules.mk
+# XDP_CLONE: nistore (transactional KV store) and the time server are not part
+# of the Multi-Paxos benchmark and do not compile against a modern libstdc++.
+# include nistore/Rules.mk
+# include timeserver/Rules.mk
 
 ##################################################################
 # General rules

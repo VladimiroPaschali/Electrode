@@ -4,7 +4,7 @@
 #
 #   sudo ./node.sh start-replicas <variant> <n> 
 #   sudo ./node.sh start-tc <leaderIdx>
-#   sudo ./node.sh client <variant> <requests> <threads> <warmup> <logfile>
+#   sudo ./node.sh client <variant> <requests> <clients> <warmup> <procs> <log>
 #   sudo ./node.sh stop
 #
 # Everything runs inside the namespaces cluster.sh made, so every packet between
@@ -17,8 +17,12 @@ root=$(dirname "$here")
 run=/tmp/electrode-run
 NS=elec
 DEV=mv
-CORE_BASE=${CORE_BASE:-2}      # replica i runs on core CORE_BASE+i
-CLIENT_CORE=${CLIENT_CORE:-1}
+CORE_BASE=${CORE_BASE:-2}          # replica i runs on core CORE_BASE+i
+CLIENT_CORE_BASE=${CLIENT_CORE_BASE:-9}   # client process j on CLIENT_CORE_BASE+j
+
+# Cores 0-15 are one hardware thread each of the sixteen physical cores here;
+# 16-31 are their SMT siblings. Staying under 16 keeps the replicas and the
+# clients on cores of their own.
 
 mkdir -p "$run"
 
@@ -65,12 +69,35 @@ cmd_start_tc() {
     echo "FastBroadCast did not come up:" >&2; cat "$run/tc.log" >&2; exit 1
 }
 
+# One client process saturates a core well before the cluster saturates: at
+# seven replicas it sends seven unicasts per request and sat at 85% of a core
+# while the leader was at 75%, so the measurement was of the client. Spreading
+# the clients over several processes, one core each, puts the bottleneck back
+# where the experiment wants it. The logs are concatenated, and parse.py reads
+# one "Completed" line per client wherever it came from.
 cmd_client() {
-    local variant=$1 requests=$2 threads=$3 warmup=$4 log=$5
-    ip netns exec "$NS-cl" \
-        taskset -c "$CLIENT_CORE" "$root/build/$variant/client" \
-            -c "$root/config.txt" -m vr -n "$requests" -t "$threads" -w "$warmup" \
-        > "$log" 2>&1
+    local variant=$1 requests=$2 clients=$3 warmup=$4 procs=$5 log=$6
+    local per=$(( clients / procs )) j pids=()
+
+    if [ $(( per * procs )) -ne "$clients" ]; then
+        echo "clients ($clients) must divide by processes ($procs)" >&2
+        exit 1
+    fi
+
+    # Unlink rather than truncate: with fs.protected_regular set, root cannot
+    # open someone else's file for writing in a sticky directory like /tmp.
+    rm -f "$log" "$log".* 2>/dev/null || true
+    : > "$log"
+    for (( j = 0; j < procs; j++ )); do
+        ip netns exec "$NS-cl" \
+            taskset -c $(( CLIENT_CORE_BASE + j )) "$root/build/$variant/client" \
+                -c "$root/config.txt" -m vr -n "$requests" -t "$per" -w "$warmup" \
+            > "$log.$j" 2>&1 &
+        pids+=($!)
+    done
+    for j in "${pids[@]}"; do wait "$j" || true; done
+    cat "$log".* >> "$log"
+    rm -f "$log".*
 }
 
 cmd_stop() {

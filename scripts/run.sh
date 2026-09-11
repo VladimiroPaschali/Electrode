@@ -32,6 +32,7 @@ variant=xdp
 replicas=3
 requests=10000
 threads=1
+client_procs=1
 warmup=2
 rep=0
 out=""
@@ -43,6 +44,7 @@ while [ $# -gt 0 ]; do
         --replicas) replicas=$2; shift 2 ;;
         --requests) requests=$2; shift 2 ;;
         --threads)  threads=$2; shift 2 ;;
+        --client-procs) client_procs=$2; shift 2 ;;
         --warmup)   warmup=$2; shift 2 ;;
         --rep)      rep=$2; shift 2 ;;
         --out)      out=$2; shift 2 ;;
@@ -138,10 +140,10 @@ fi
 rsh "sudo $REMOTE/scripts/node.sh start-replicas $cxx $replicas" >/dev/null
 sleep 1
 
-rsh "sudo $REMOTE/scripts/node.sh client $cxx $requests $threads $warmup /tmp/electrode-run/client.log" || true
+rsh "sudo $REMOTE/scripts/node.sh client $cxx $requests $threads $warmup $client_procs /tmp/electrode-run/client.log" || true
 rsh "cat /tmp/electrode-run/client.log" > /tmp/electrode-client.log
 
 python3 "$here/parse.py" \
     --variant "$variant" --replicas "$replicas" --requests "$requests" \
-    --threads "$threads" --warmup "$warmup" --rep "$rep" \
+    --threads "$threads" --client-procs "$client_procs" --warmup "$warmup" --rep "$rep" \
     ${out:+--out "$out"} /tmp/electrode-client.log

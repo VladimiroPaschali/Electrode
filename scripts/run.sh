@@ -140,10 +140,52 @@ fi
 rsh "sudo $REMOTE/scripts/node.sh start-replicas $cxx $replicas" >/dev/null
 sleep 1
 
+# What the DUT costs, measured across the whole client run.
+#
+# The loader process is not the thing to watch: it sits in pause() and burns
+# nothing, because the work is the XDP program, which runs in NAPI softirq on
+# whichever core takes the interrupt. So the number that means something is
+# softirq time, in cores rather than percent -- "this node spent 0.4 of a core
+# forwarding" reads the same whatever the machine has. The loader's own CPU is
+# recorded beside it precisely to show that it is nil.
+cpu_snapshot() {
+    awk '/^cpu /{busy=$2+$3+$4+$7+$8+$9; printf "%d %d %d\n", busy, $8, busy+$5+$6}' /proc/stat
+}
+proc_cpu() {
+    [ -r "/proc/$1/stat" ] && awk '{print $14+$15}' "/proc/$1/stat" || echo 0
+}
+
+fpid=$(cat "$fanout_pid" 2>/dev/null || echo 0)
+read -r cpu_b0 cpu_sq0 cpu_t0 <<< "$(cpu_snapshot)"
+proc0=$(proc_cpu "$fpid")
+
+rsh "sudo rm -f /tmp/electrode-run/client.log" >/dev/null 2>&1 || true
 rsh "sudo $REMOTE/scripts/node.sh client $cxx $requests $threads $warmup $client_procs /tmp/electrode-run/client.log" || true
-rsh "cat /tmp/electrode-run/client.log" > /tmp/electrode-client.log
+
+read -r cpu_b1 cpu_sq1 cpu_t1 <<< "$(cpu_snapshot)"
+proc1=$(proc_cpu "$fpid")
+
+ncpu=$(nproc)
+hz=$(getconf CLK_TCK)
+dut_busy=$(awk -v d=$((cpu_b1 - cpu_b0)) -v t=$((cpu_t1 - cpu_t0)) -v n="$ncpu" \
+    'BEGIN { printf "%.4f", (t > 0 ? d / t * n : 0) }')
+dut_softirq=$(awk -v d=$((cpu_sq1 - cpu_sq0)) -v t=$((cpu_t1 - cpu_t0)) -v n="$ncpu" \
+    'BEGIN { printf "%.4f", (t > 0 ? d / t * n : 0) }')
+dut_loader=$(awk -v d=$((proc1 - proc0)) -v hz="$hz" 'BEGIN { printf "%.3f", d / hz }')
+
+# Both copies go first. A run that fails leaves the previous one's log where
+# it was, and parsing that reports the last measurement again under this run's
+# labels -- which is how three different modes came out with the same latency
+# to the second decimal, and the same packet count, before anyone noticed.
+rm -f /tmp/electrode-client.log
+rsh "cat /tmp/electrode-run/client.log" > /tmp/electrode-client.log 2>/dev/null || true
+if [ ! -s /tmp/electrode-client.log ]; then
+    echo "the job produced no output; the run is not a measurement" >&2
+fi
 
 python3 "$here/parse.py" \
     --variant "$variant" --replicas "$replicas" --requests "$requests" \
     --threads "$threads" --client-procs "$client_procs" --warmup "$warmup" --rep "$rep" \
+    --dut-busy-cores "$dut_busy" --dut-softirq-cores "$dut_softirq" \
+    --dut-loader-cpu-s "$dut_loader" \
     ${out:+--out "$out"} /tmp/electrode-client.log

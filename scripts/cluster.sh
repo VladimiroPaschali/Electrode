@@ -33,6 +33,9 @@ NS=elec
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(dirname "$here")
 
+HOSTS_BEGIN="# BEGIN XDP_CLONE cluster (scripts/cluster.sh)"
+HOSTS_END="# END XDP_CLONE cluster"
+
 ip_of()  { echo "$PREFIX.$1"; }
 mac_of() { printf '02:00:00:00:00:%02x\n' "$1"; }
 
@@ -108,8 +111,29 @@ cmd_up() {
         exit 1
     fi
 
+    hosts_write "${hosts[@]}"
+
     echo "up: $n replicas + client"
     cmd_show
+}
+
+# One /etc/hosts line per namespace, rewritten on every `up` and taken out on
+# `down`. Open MPI resolves each rank by name -- the launch agent enters the
+# namespace whose name it is given -- so a cluster bigger than the names on
+# file simply cannot be launched. Generated rather than hand-kept for that
+# reason: it has to follow the size.
+hosts_write() {  # $@ = host octets
+    local host
+    hosts_remove
+    {
+        echo "$HOSTS_BEGIN"
+        for host in "$@"; do printf '%s %s\n' "$(ip_of "$host")" "$(ns_of "$host")"; done
+        echo "$HOSTS_END"
+    } >> /etc/hosts
+}
+
+hosts_remove() {
+    sed -i "/^${HOSTS_BEGIN//\//\\/}$/,/^${HOSTS_END//\//\\/}$/d" /etc/hosts
 }
 
 cmd_down() {
@@ -131,6 +155,7 @@ cmd_down() {
         [ -z "$(ip -br link show type macvlan 2>/dev/null | grep "@$PARENT" || true)" ] && break
         sleep 0.1
     done
+    hosts_remove
     echo "down"
 }
 

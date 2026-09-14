@@ -29,7 +29,9 @@ KEY = {"Median": "median_us", "90th percentile": "p90_us",
 
 FIELDS = ["variant", "replicas", "threads", "client_procs", "requests",
           "warmup", "rep", "throughput_kops", "median_us", "p90_us", "p95_us",
-          "p99_us", "elapsed_s", "elapsed_spread", "clients_done", "ok", "note"]
+          "p99_us", "elapsed_s", "elapsed_spread", "clients_done",
+          "dut_busy_cores", "dut_softirq_cores", "dut_loader_cpu_s",
+          "ok", "note"]
 
 
 def main():
@@ -42,6 +44,12 @@ def main():
     ap.add_argument("--warmup", type=int, required=True)
     ap.add_argument("--rep", type=int, default=0)
     ap.add_argument("--client-procs", type=int, default=1)
+    # Measured on the DUT across the whole client run, in cores rather than
+    # percent. The loader's own CPU is there to show it is nil: the work is the
+    # XDP program, in softirq.
+    ap.add_argument("--dut-busy-cores", type=float, default=None)
+    ap.add_argument("--dut-softirq-cores", type=float, default=None)
+    ap.add_argument("--dut-loader-cpu-s", type=float, default=None)
     ap.add_argument("--out")
     a = ap.parse_args()
 
@@ -56,6 +64,11 @@ def main():
     row.update(variant=a.variant, replicas=a.replicas, requests=a.requests,
                threads=a.threads, client_procs=a.client_procs,
                warmup=a.warmup, rep=a.rep, clients_done=len(done))
+    for k, v in (("dut_busy_cores", a.dut_busy_cores),
+                 ("dut_softirq_cores", a.dut_softirq_cores),
+                 ("dut_loader_cpu_s", a.dut_loader_cpu_s)):
+        if v is not None:
+            row[k] = round(v, 4)
 
     if not done:
         row["ok"] = 0
@@ -83,7 +96,7 @@ def main():
 
     print(",".join(f"{k}={row[k]}" for k in
                    ("variant", "replicas", "threads", "throughput_kops",
-                    "median_us", "p99_us", "ok")))
+                    "median_us", "p99_us", "dut_softirq_cores", "ok")))
 
     if a.out:
         new = not os.path.exists(a.out)

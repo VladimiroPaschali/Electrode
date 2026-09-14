@@ -44,6 +44,10 @@ def main():
     if dropped:
         print(f"({dropped} rows dropped: ok=0)\n")
 
+    def col(rs, name):
+        vals = [float(r[name]) for r in rs if r.get(name) not in (None, "")]
+        return agg(vals)[0] if vals else None
+
     summary = {}
     for key, rs in rows.items():
         tp, tp_sd = agg([float(r["throughput_kops"]) for r in rs])
@@ -55,7 +59,10 @@ def main():
                          if r.get("elapsed_spread")])
         summary[key] = dict(n=len(rs), tp=tp, tp_sd=tp_sd, med=med,
                             med_sd=med_sd, p90=p90, p95=p95, p99=p99,
-                            spread=spread)
+                            spread=spread,
+                            dut_busy=col(rs, "dut_busy_cores"),
+                            dut_softirq=col(rs, "dut_softirq_cores"),
+                            dut_loader=col(rs, "dut_loader_cpu_s"))
 
     replicas = sorted({k[0] for k in summary})
     threads = sorted({k[2] for k in summary})
@@ -73,6 +80,17 @@ def main():
                 cells.append(f"{s['tp']:8.1f} ({s['tp_sd']:4.1f}) {s['med']:7.1f}"
                              if s else " " * 22)
             print(f"{t:>8} | " + " | ".join(cells))
+
+        # What the DUT spent getting there, in cores: the fan-out node's own
+        # cost, which the throughput alone does not show.
+        print()
+        for v in present:
+            sq = [summary[(n, v, t)]["dut_softirq"] for t in threads
+                  if (n, v, t) in summary
+                  and summary[(n, v, t)]["dut_softirq"] is not None]
+            if sq:
+                print(f"  DUT softirq {LABEL[v].replace(chr(92), ''):>20}: "
+                      f"{max(sq):.2f} cores at its busiest")
 
         # Peak throughput, which is what the broadcast offload is supposed to move.
         print()
@@ -94,7 +112,8 @@ def main():
     # without opening twelve files.
     summary_csv = os.path.join(outdir, "summary.csv")
     cols = ["replicas", "variant", "clients", "reps", "kops", "kops_sd",
-            "p50_us", "p50_sd", "p90_us", "p95_us", "p99_us", "elapsed_spread"]
+            "p50_us", "p50_sd", "p90_us", "p95_us", "p99_us", "elapsed_spread",
+            "dut_busy_cores", "dut_softirq_cores", "dut_loader_cpu_s"]
     with open(summary_csv, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(cols)
@@ -107,7 +126,10 @@ def main():
                         f"{s_['med']:.3f}", f"{s_['med_sd']:.3f}",
                         f"{s_['p90']:.3f}", f"{s_['p95']:.3f}",
                         f"{s_['p99']:.3f}",
-                        f"{s_['spread']:.4f}" if s_["spread"] else ""])
+                        f"{s_['spread']:.4f}" if s_["spread"] else "",
+                        f"{s_['dut_busy']:.4f}" if s_["dut_busy"] is not None else "",
+                        f"{s_['dut_softirq']:.4f}" if s_["dut_softirq"] is not None else "",
+                        f"{s_['dut_loader']:.3f}" if s_["dut_loader"] is not None else ""])
     print(f"summary in {summary_csv}")
 
     # pgfplots: one file per (replicas, variant), x = clients, y = kops, with

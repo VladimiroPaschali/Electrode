@@ -81,3 +81,10 @@ done
 
 echo
 echo "results in $out"
+
+# The summary is part of the run, not a step to remember afterwards: a sweep
+# that ends without one invites reading the raw rows, which is where the
+# repetitions get mistaken for measurements.
+if ! python3 "$here/report.py" "$out"; then
+    echo "the sweep finished but the summary failed; the rows are in $out" >&2
+fi

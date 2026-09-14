@@ -449,6 +449,9 @@ int PrepareFastReply_main(struct xdp_md *ctx) {
 
 SEC("FastBroadCast")
 int FastBroadCast_main(struct __sk_buff *skb) {
+	/* A copy this program already made, on its way out. */
+	if (skb->mark == FAST_BROADCAST_MARK) return TC_ACT_OK;
+
 	void *data_end = (void *)(long)skb->data_end;
 	void *data     = (void *)(long)skb->data;
 	struct ethhdr *eth = data;
@@ -497,51 +500,66 @@ int FastBroadCast_main(struct __sk_buff *skb) {
 	struct paxos_ctr_state *ctr_state = bpf_map_lookup_elem(&map_ctr_state, &zero);
 	if (!ctr_state) return TC_ACT_OK; // can't find the context...
 
-	char id, nxt;
-	if (type_str[0] == 's' && type_str[1] == 'p') {
-		id = !ctr_state -> leaderIdx;
+	/* XDP_CLONE: iterative, where upstream was recursive.
+	 *
+	 * Upstream re-enters this hook once per follower: it stashes the next
+	 * replica index in the first byte of the type string, calls
+	 * bpf_clone_redirect(), and the clone arrives back here to do the same for
+	 * the one after. That nests one level of dev_queue_xmit() per follower,
+	 * against XMIT_RECURSION_LIMIT, which is 8. It works to seven replicas and
+	 * silently stops broadcasting beyond that -- at fifteen the followers stop
+	 * hearing PREPARE and the cluster falls into a view change.
+	 *
+	 * One run can clone as many times as it likes instead, since
+	 * bpf_clone_redirect() leaves the original alone. What is then needed is a
+	 * way for a copy not to be duplicated again on its way out, and skb->mark
+	 * does that without touching the packet -- which also means the type string
+	 * no longer has to carry an index and be restored afterwards.
+	 */
+	*(__u32 *)payload = msg_view;
+	type_str[0] = 's', type_str[1] = 'p';
 
-		nxt = id + 1;
-		nxt += ctr_state -> leaderIdx == nxt;
-		type_str[0] = nxt;
-		type_str[1] = 'M'; // sign for multicast.
-		if (nxt < CLUSTER_SIZE) bpf_clone_redirect(skb, skb -> ifindex, 0);
-	} else {
-		id = type_str[0];
+	for (int i = 0; i < CLUSTER_SIZE; i++) {
+		struct paxos_configure *replicaInfo;
+		/* A key of its own, not &i: passing the address of the loop counter to
+		 * a helper puts it on the stack, the verifier stops tracking it as a
+		 * scalar, and it can no longer see the loop advance -- "infinite loop
+		 * detected", on a loop that plainly terminates.
+		 */
+		__u32 key = i;
 
-		nxt = id + 1;
-		nxt += ctr_state -> leaderIdx == nxt;
-		type_str[0] = nxt;
-		if (nxt < CLUSTER_SIZE) bpf_clone_redirect(skb, skb -> ifindex, 0);
+		if (i != ctr_state->leaderIdx) {
+			replicaInfo = bpf_map_lookup_elem(&map_configure, &key);
+			if (replicaInfo) {
+				/* bpf_clone_redirect() may have moved the buffer. */
+				data_end = (void *)(long)skb->data_end;
+				data     = (void *)(long)skb->data;
+				eth = data;
+				ip = data + sizeof(struct ethhdr);
+				udp = data + sizeof(struct ethhdr) + sizeof(struct iphdr);
+
+				/* Nested rather than an early return: a loop with more than
+				 * one exit is not one clang will unroll, and a rolled loop is
+				 * what the verifier turns down here.
+				 */
+				if ((void *)(udp + 1) <= data_end) {
+					udp -> dest = replicaInfo -> port;
+					udp -> check = 0;
+					ip -> daddr = replicaInfo -> addr;
+					ip -> check = compute_ip_checksum(ip);
+					memcpy(eth -> h_dest, replicaInfo -> eth, ETH_ALEN);
+
+					skb->mark = FAST_BROADCAST_MARK;
+					bpf_clone_redirect(skb, skb -> ifindex, 0);
+				}
+			}
+		}
 	}
 
-	// Why so verbose? `bpf_clone_redirect` may change buffer — from linux manual.
-	data_end = (void *)(long)skb->data_end;
-	data     = (void *)(long)skb->data;
-	eth = data;
-	ip = data + sizeof(struct ethhdr);
-	udp = data + sizeof(struct ethhdr) + sizeof(struct iphdr);
-	payload = data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + MAGIC_LEN;
-	if (payload + sizeof(__u64) > data_end) return TC_ACT_OK; // don't have typelen...
-	typeLen = *(__u64 *)payload;
-	payload = payload + sizeof(__u64);
-	type_str = payload;
-	if (type_str + 5 >= data_end) return TC_ACT_SHOT;
-	if (typeLen >= MTU || payload + typeLen > data_end) return TC_ACT_SHOT; // don't have type str...
-	payload += typeLen;
-	if (payload + FAST_PAXOS_DATA_LEN > data_end) return TC_ACT_SHOT;
-
-	*(__u32*)payload = msg_view;
-	type_str[0] = 's', type_str[1] = 'p';
-	struct paxos_configure *replicaInfo = bpf_map_lookup_elem(&map_configure, &id);
-	if (!replicaInfo) return TC_ACT_SHOT;
-	udp -> dest = replicaInfo -> port;
-	udp -> check = 0;
-	ip -> daddr = replicaInfo -> addr;
-	ip -> check = compute_ip_checksum(ip);
-	memcpy(eth -> h_dest, replicaInfo -> eth, ETH_ALEN);
-
-	return TC_ACT_OK;
+	/* Every follower has its own copy; the original was addressed to one of
+	 * them and has been duplicated for all of them.
+	 */
+	return TC_ACT_SHOT;
 }
 
 char _license[] SEC("license") = "GPL";

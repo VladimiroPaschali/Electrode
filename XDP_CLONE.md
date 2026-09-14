@@ -217,6 +217,41 @@ below the IP counter. The XDP points send the same 40% fewer datagrams and put
 exactly that many frames on the wire, addressed to the fan-out node; both
 followers still receive their 24027, which were made there.
 
+## Scaling past seven replicas
+
+Upstream's `FastBroadCast` re-enters its own hook once per follower: it stashes
+the next replica index in the first byte of the type string, calls
+`bpf_clone_redirect()`, and the clone comes back to do the same for the one
+after. That nests one `dev_queue_xmit()` per follower against
+`XMIT_RECURSION_LIMIT`, which is **8**. It works to seven replicas and then
+silently stops broadcasting: at fifteen the followers stop hearing PREPARE and
+the cluster falls into a view change, `DoViewChangeMessage` in 287 fragments.
+
+One run can clone as many times as it likes instead, since
+`bpf_clone_redirect()` leaves the original alone. What is then needed is a way
+for a copy not to be duplicated again on its way out, and `skb->mark` does that
+without touching the packet — which also means the type string no longer has to
+carry an index and be restored afterwards. The loop is rolled, not unrolled;
+two things about it are worth knowing, because each cost an hour:
+
+- **The map key must not be `&i`.** Passing the address of the loop counter to
+  a helper puts it on the stack, the verifier stops tracking it as a scalar,
+  and it reports *"infinite loop detected"* on a loop that plainly terminates.
+  A `__u32 key = i` beside it is the whole fix.
+- **`#pragma unroll` will not save you.** clang does not unroll a loop with more
+  than one exit, so an early `return` inside the body quietly leaves it rolled.
+
+Verified at 31 replicas: the leader hands 12,012 datagrams to the stack and
+732,822 frames leave its interface — the same count the baseline puts there
+from 732,732 datagrams of its own.
+
+| 31 replicas, 8 clients | throughput | median |
+|---|---|---|
+| baseline | 5.39 kops | 1485 µs |
+| Electrode (TC) | 7.47 (1.39×) | 1067 |
+| XDP_CLONE | 10.41 (1.93×) | 765 |
+| XDP_CLONE inline | 10.68 (1.98×) | 744 |
+
 ## Known limits
 
 - **Namespaces, not machines.** The replicas share grecale's CPU, so the
@@ -227,7 +262,13 @@ followers still receive their 24027, which were made there.
   same: the shared page and the missing 320-byte memcpy are a saving on a
   resource nothing is competing for. That difference belongs to
   `microbenchmark/`, which measures the node itself.
-- **The TC point nests `bpf_clone_redirect`.** One level per follower, against
-  the kernel's `xmit_recursion` limit of 8 — fine to seven replicas, not beyond.
+- **Cluster sizes are odd.** Multi-Paxos wants 2f+1, so the sizes near thirty
+  are 31 and 33, not 32.
+- **Past fourteen replicas they share cores.** grecale has sixteen physical
+  cores, `scripts/node.sh` gives the replicas fourteen of them and wraps, so at
+  thirty-one most cores carry two. That is a property of running a thirty-one
+  node cluster on one machine, not of any variant, and it is the same for all
+  four — but it is why the absolute throughput falls away with the cluster
+  size.
 - **View changes are not handled**, upstream's own caveat. A run in which one
   happens is reported with `ok=0` rather than as a measurement.

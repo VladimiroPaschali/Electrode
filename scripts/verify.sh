@@ -3,8 +3,8 @@
 # than quietly falling back to the baseline. Runs on maestrale; the grecale half
 # is scripts/verify-node.sh.
 #
-#   ./verify.sh [variant ...]     default: all four
-#   sudo scripts/cluster.sh up 3  on grecale first
+#   REPLICAS=31 ./verify.sh [variant ...]    default: all four, three replicas
+#   sudo scripts/cluster.sh up <n>           on grecale first
 #
 # What distinguishes the four is not visible in the throughput, and three of
 # them would produce a full set of plausible numbers if their offload silently
@@ -31,6 +31,7 @@ REMOTE=${REMOTE:-XDP_CLONE/electrode}
 FANOUT_IP=${FANOUT_IP:-192.168.101.1}
 PORT=${PORT:-12345}
 REQUESTS=${REQUESTS:-3000}
+REPLICAS=${REPLICAS:-3}
 
 # Resolved as the login user: under sudo, $HOME is /root.
 REMOTE_ROOT=$(ssh "$GRECALE" "echo \$HOME/$REMOTE")
@@ -83,7 +84,7 @@ for v in "${variants[@]}"; do
 
     echo "===== $v"
     ssh "$GRECALE" \
-        "sudo $REMOTE_ROOT/scripts/verify-node.sh $v $cxx $REQUESTS $FANOUT_IP $PORT" \
+        "sudo $REMOTE_ROOT/scripts/verify-node.sh $v $cxx $REQUESTS $FANOUT_IP $PORT $REPLICAS" \
         || { echo "  (failed)" >&2; rc=1; }
     echo
 done

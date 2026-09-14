@@ -17,19 +17,42 @@ root=$(dirname "$here")
 run=/tmp/electrode-run
 NS=elec
 DEV=mv
-CORE_BASE=${CORE_BASE:-2}          # replica i runs on core CORE_BASE+i
-CLIENT_CORE_BASE=${CLIENT_CORE_BASE:-9}   # client process j on CLIENT_CORE_BASE+j
+# Cores 0-15 are one hardware thread each of the sixteen physical cores on
+# grecale; 16-31 are their SMT siblings. The replicas get the physical ones and
+# the clients the siblings of the two the system keeps, so that a client never
+# shares a core with a replica.
+#
+# Past fourteen replicas they have to share, and the assignment wraps: at
+# thirty-one replicas most cores carry two. That is a property of running a
+# thirty-one node cluster on one sixteen-core machine, not of any variant, and
+# it is the same for all four.
+REPLICA_CPUS=${REPLICA_CPUS:-2-15}
+CLIENT_CPUS=${CLIENT_CPUS:-16-19}
 
-# Cores 0-15 are one hardware thread each of the sixteen physical cores here;
-# 16-31 are their SMT siblings. Staying under 16 keeps the replicas and the
-# clients on cores of their own.
+# "2-15,20" -> "2 3 4 ... 15 20"
+expand_cpus() {
+    local spec=$1 out=() part lo hi
+    IFS=, read -ra parts <<< "$spec"
+    for part in "${parts[@]}"; do
+        if [[ $part == *-* ]]; then
+            lo=${part%%-*}; hi=${part##*-}
+            for (( c = lo; c <= hi; c++ )); do out+=("$c"); done
+        else
+            out+=("$part")
+        fi
+    done
+    echo "${out[@]}"
+}
+
+read -ra REPLICA_CPU_LIST <<< "$(expand_cpus "$REPLICA_CPUS")"
+read -ra CLIENT_CPU_LIST <<< "$(expand_cpus "$CLIENT_CPUS")"
 
 mkdir -p "$run"
 
 cmd_start_replicas() {
     local variant=$1 n=$2 i core
     for (( i = 0; i < n; i++ )); do
-        core=$(( CORE_BASE + i ))
+        core=${REPLICA_CPU_LIST[$(( i % ${#REPLICA_CPU_LIST[@]} ))]}
         ip netns exec "$NS-r$i" \
             setsid taskset -c "$core" "$root/build/$variant/replica" \
                 -c "$root/config.txt" -m vr -i "$i" \
@@ -90,7 +113,8 @@ cmd_client() {
     : > "$log"
     for (( j = 0; j < procs; j++ )); do
         ip netns exec "$NS-cl" \
-            taskset -c $(( CLIENT_CORE_BASE + j )) "$root/build/$variant/client" \
+            taskset -c "${CLIENT_CPU_LIST[$(( j % ${#CLIENT_CPU_LIST[@]} ))]}" \
+                "$root/build/$variant/client" \
                 -c "$root/config.txt" -m vr -n "$requests" -t "$per" -w "$warmup" \
             > "$log.$j" 2>&1 &
         pids+=($!)

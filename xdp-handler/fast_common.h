@@ -33,6 +33,11 @@
 
 #define FAST_PAXOS_DATA_LEN 12
 #define BROADCAST_SIGN_BIT (1<<31)
+
+/* skb->mark on a copy FastBroadCast has already made, so that it is not
+ * duplicated again when it comes back round the egress path.
+ */
+#define FAST_BROADCAST_MARK 0x20050318u
 #define QUORUM_SIZE ((CLUSTER_SIZE + 1) >> 1)
 #define QUORUM_BITSET_ENTRY 1024 // must be 2^t
 

@@ -4,7 +4,7 @@
 # own source of bugs, and this script has to be trusted to say whether the
 # measurement is trustworthy.
 #
-#   sudo ./verify-node.sh <variant> <cxx-build> <requests> <fanout-ip> <port>
+#   sudo ./verify-node.sh <variant> <cxx-build> <requests> <fanout-ip> <port> [replicas]
 
 set -uo pipefail
 
@@ -17,8 +17,9 @@ cxx=${2:?cxx build}
 requests=${3:?requests}
 fanout_ip=${4:?fanout ip}
 port=${5:?port}
+n=${6:-3}
 
-for ns in elec-r0 elec-r1 elec-r2 elec-cl; do
+for ns in $(for ((i = 0; i < n; i++)); do echo "elec-r$i"; done) elec-cl; do
     if ! ip netns list | awk '{print $1}' | grep -qx "$ns"; then
         echo "no namespace $ns -- run 'sudo scripts/cluster.sh up 3' first" >&2
         exit 1
@@ -28,7 +29,7 @@ done
 if [ "$v" = tc ]; then
     ./scripts/node.sh start-tc 0 >/dev/null || exit 1
 fi
-./scripts/node.sh start-replicas "$cxx" 3 >/dev/null || exit 1
+./scripts/node.sh start-replicas "$cxx" "$n" >/dev/null || exit 1
 sleep 1
 
 # A file per variant, removed first: a stale capture from the previous one
@@ -37,6 +38,8 @@ rm -f "/tmp/v-$v-r"*.pcap
 pids=()
 ip netns exec elec-r0 tcpdump -i mv -nn -Q out -w "/tmp/v-$v-r0.pcap" udp port "$port" >/dev/null 2>&1 &
 pids+=($!)
+# Two followers are enough to show the fan-out; capturing on all thirty would
+# cost more than it tells.
 for i in 1 2; do
     ip netns exec "elec-r$i" tcpdump -i mv -nn -Q in -w "/tmp/v-$v-r$i.pcap" \
         "udp port $port and src 192.168.101.10" >/dev/null 2>&1 &

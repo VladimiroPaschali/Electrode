@@ -47,9 +47,15 @@ def main():
     summary = {}
     for key, rs in rows.items():
         tp, tp_sd = agg([float(r["throughput_kops"]) for r in rs])
-        med, _ = agg([float(r["median_us"]) for r in rs])
+        med, med_sd = agg([float(r["median_us"]) for r in rs])
+        p90, _ = agg([float(r["p90_us"]) for r in rs])
+        p95, _ = agg([float(r["p95_us"]) for r in rs])
         p99, _ = agg([float(r["p99_us"]) for r in rs])
-        summary[key] = dict(n=len(rs), tp=tp, tp_sd=tp_sd, med=med, p99=p99)
+        spread, _ = agg([float(r["elapsed_spread"]) for r in rs
+                         if r.get("elapsed_spread")])
+        summary[key] = dict(n=len(rs), tp=tp, tp_sd=tp_sd, med=med,
+                            med_sd=med_sd, p90=p90, p95=p95, p99=p99,
+                            spread=spread)
 
     replicas = sorted({k[0] for k in summary})
     threads = sorted({k[2] for k in summary})
@@ -82,6 +88,27 @@ def main():
             print(f"  peak {LABEL[v].replace(chr(92), ''):>20}: {peak:8.1f} kops "
                   f"at {at:>3} clients{rel}")
         print()
+
+    # Everything the .dat files hold, in one table: one row per (replicas,
+    # variant, clients), so the whole experiment can be read or re-plotted
+    # without opening twelve files.
+    summary_csv = os.path.join(outdir, "summary.csv")
+    cols = ["replicas", "variant", "clients", "reps", "kops", "kops_sd",
+            "p50_us", "p50_sd", "p90_us", "p95_us", "p99_us", "elapsed_spread"]
+    with open(summary_csv, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(cols)
+        for (n, v, t), s_ in sorted(summary.items(),
+                                    key=lambda kv: (kv[0][0],
+                                                    ORDER.index(kv[0][1]),
+                                                    kv[0][2])):
+            w.writerow([n, v, t, s_["n"],
+                        f"{s_['tp']:.3f}", f"{s_['tp_sd']:.3f}",
+                        f"{s_['med']:.3f}", f"{s_['med_sd']:.3f}",
+                        f"{s_['p90']:.3f}", f"{s_['p95']:.3f}",
+                        f"{s_['p99']:.3f}",
+                        f"{s_['spread']:.4f}" if s_["spread"] else ""])
+    print(f"summary in {summary_csv}")
 
     # pgfplots: one file per (replicas, variant), x = clients, y = kops, with
     # the latency alongside so a throughput-latency curve needs no second file.

@@ -4,6 +4,8 @@
 # distribution's headers, and the loader links the distribution's libbpf.
 #
 #   make                                    broadcast offload only
+#   make EXTRA_CFLAGS="-DELECTRODE_XDP_OFFLOADS -DFAST_QUORUM_PRUNE"
+#                                           and the quorum prune
 #   make EXTRA_CFLAGS=-DCLUSTER_SIZE=5      2f+1 = 5
 #   make EXTRA_CFLAGS=-DELECTRODE_XDP_OFFLOADS   also the two XDP offloads
 

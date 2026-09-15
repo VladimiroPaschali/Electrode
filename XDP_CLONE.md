@@ -252,6 +252,70 @@ from 732,732 datagrams of its own.
 | XDP_CLONE | 10.41 (1.93×) | 765 |
 | XDP_CLONE inline | 10.68 (1.98×) | 744 |
 
+## The other half: where the leader's time actually goes
+
+The broadcast offload takes the *sends* off the leader and leaves the
+*receives*, and the receives are what is left. Measured, at four cluster sizes:
+
+| replicas | leader CPU per request | datagrams **received**/request | datagrams **sent**/request |
+|---|---|---|---|
+| 3 | 21.4 µs | 4.9 | 4.9 |
+| 7 | 34.0 µs | 11.3 | 4.8 |
+| 15 | 51.2 µs | 22.2 | 4.4 |
+| 31 | 97.5 µs | 44.9 | 4.3 |
+
+The sends stay flat while the cluster grows tenfold — that is the offload, and
+it has already removed everything it can. The receives grow linearly, because
+every follower still answers with a PrepareOK the leader has to take off the
+socket and parse. A fit gives **12 µs fixed plus 1.9 µs for every datagram
+received**; at thirty-one replicas the receives are 85% of the leader's cost.
+(The absolute figures include the warmup, so read the slope, not the
+intercept.)
+
+That is precisely what Electrode's *other* offload attacks, so the two belong
+in the same table. At 31 replicas, 16 clients, two repetitions each:
+
+| | throughput | vs baseline | median |
+|---|---|---|---|
+| baseline | 3.35 kops | 1.00x | 4864 µs |
+| `prune` — quorum prune alone | 3.80 | 1.13x | 4209 |
+| `tc` — Electrode's broadcast | 6.15 | 1.84x | 2436 |
+| `xdp` — XDP_CLONE broadcast | 7.76 | 2.32x | 1774 |
+| **`xdp-prune` — both** | **10.09** | **3.01x** | **1595** |
+
+The two are **more than additive**: +132% and +13% on their own, +201%
+together. Pruning receives is worth little while the leader is still send-bound
+— which is why `prune` alone barely moves — and worth a further 1.30x once the
+sends are gone.
+
+### They are not separable
+
+`FastBroadCast`, the **TC** program, clears the quorum bitset whenever it sees
+a PREPARE leave, *before* its own `is_broadcast` check. `HandlePrepareOK`, the
+**XDP** program, counts into that same bitset. Attach the XDP half alone and
+the entry never matches the current (view, opnum), so nothing is pruned — and
+since `FAST_QUORUM_PRUNE` compiles the userspace quorum count out, a leader
+handed every PrepareOK commits on the first one. The leader then sits in
+`ResendPrepare` for ever. Both halves go on together, which is what
+`scripts/node.sh xdp-start` does.
+
+### What it took to run them at all
+
+- **The 6.14 verifier turns down `HandleRequest_main`**: 1,000,001 instructions
+  against a limit of 1,000,000. It belongs to the batching offload, so it is
+  behind `FAST_BATCH` now and the three the quorum prune needs verify as they
+  are.
+- **A macvlan has no native XDP.** Upstream only ever asks for
+  `XDP_FLAGS_DRV_MODE`; the loader now falls back to generic and says which it
+  used. Generic runs after the skb is built, so it does not save the
+  allocation — it still takes the datagram before the socket queue, the
+  `recvfrom` and the protobuf parse, which is the 1.9 µs.
+- **`/sys/fs/bpf` is invisible inside a namespace.** `ip netns exec` remounts
+  `/sys` in a mount namespace of its own, shadowing the bpffs; and a replica in
+  another namespace could not have found the pin anyway. A bpffs at `/run/bpf`
+  is inherited by all of them, one directory per replica since they pin the
+  same names.
+
 ## Known limits
 
 - **Namespaces, not machines.** The replicas share grecale's CPU, so the

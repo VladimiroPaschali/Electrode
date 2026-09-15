@@ -9,6 +9,10 @@
 #
 #   baseline     nowhere: the leader sends one packet per follower
 #   tc           on the leader's own TC egress hook (Electrode's offload)
+#   prune        nowhere, but Electrode's *other* offload is on: the leader's
+#                PrepareOKs are pruned in XDP before they reach userspace
+#   xdp-prune    both, which is the question -- the broadcast takes the sends
+#                off the leader and the receives are what is left
 #   xdp          on this node, XDP_CLONE_TX, a page and a header per copy
 #   xdp-inline   on this node, XDP_CLONE_TX with the descriptor stamped on the
 #                original, so every frame leaves from the one RX page and each
@@ -54,10 +58,14 @@ while [ $# -gt 0 ]; do
 done
 
 case "$variant" in
-    baseline|tc)  cxx=$variant;  object=fanout.bpf.o ;;
-    xdp)          cxx=xdp;       object=fanout.bpf.o ;;
-    xdp-inline)   cxx=xdp;       object=fanout_inline.bpf.o ;;
-    *) echo "variant must be baseline, tc, xdp or xdp-inline" >&2; exit 1 ;;
+    baseline|tc)      cxx=$variant;   object=fanout.bpf.o ;;
+    xdp)              cxx=xdp;        object=fanout.bpf.o ;;
+    xdp-inline)       cxx=xdp;        object=fanout_inline.bpf.o ;;
+    prune)            cxx=prune;      object=fanout.bpf.o ;;
+    xdp-prune)        cxx=xdp-prune;  object=fanout.bpf.o ;;
+    xdp-inline-prune) cxx=xdp-prune;  object=fanout_inline.bpf.o ;;
+    *) echo "variant must be baseline, tc, xdp, xdp-inline, prune," \
+            "xdp-prune or xdp-inline-prune" >&2; exit 1 ;;
 esac
 
 rsh() { ssh "$GRECALE" "$@"; }
@@ -137,6 +145,13 @@ if [ "$variant" = tc ]; then
     rsh "sudo $REMOTE/scripts/node.sh start-tc 0" >/dev/null
 fi
 
+# Before the replicas: they open the pinned map at startup and give up if it
+# is not there.
+case "$variant" in
+    prune|xdp-prune|xdp-inline-prune)
+        rsh "sudo $REMOTE/scripts/node.sh xdp-start $replicas" >/dev/null ;;
+esac
+
 rsh "sudo $REMOTE/scripts/node.sh start-replicas $cxx $replicas" >/dev/null
 sleep 1
 
@@ -151,18 +166,25 @@ sleep 1
 cpu_snapshot() {
     awk '/^cpu /{busy=$2+$3+$4+$7+$8+$9; printf "%d %d %d\n", busy, $8, busy+$5+$6}' /proc/stat
 }
+
+# Per-core, because the total hides the thing that matters when the RSS
+# indirection is narrow: sixteen cores at 4% and one core at 64% are the same
+# 0.64 cores, and only one of them is close to a limit.
+percore_snapshot() { awk '/^cpu[0-9]/{print $1, $2+$3+$4+$7+$8+$9, $2+$3+$4+$5+$6+$7+$8+$9}' /proc/stat; }
 proc_cpu() {
     [ -r "/proc/$1/stat" ] && awk '{print $14+$15}' "/proc/$1/stat" || echo 0
 }
 
 fpid=$(cat "$fanout_pid" 2>/dev/null || echo 0)
 read -r cpu_b0 cpu_sq0 cpu_t0 <<< "$(cpu_snapshot)"
+percore_snapshot > /tmp/electrode-percore.0
 proc0=$(proc_cpu "$fpid")
 
 rsh "sudo rm -f /tmp/electrode-run/client.log" >/dev/null 2>&1 || true
 rsh "sudo $REMOTE/scripts/node.sh client $cxx $requests $threads $warmup $client_procs /tmp/electrode-run/client.log" || true
 
 read -r cpu_b1 cpu_sq1 cpu_t1 <<< "$(cpu_snapshot)"
+percore_snapshot > /tmp/electrode-percore.1
 proc1=$(proc_cpu "$fpid")
 
 ncpu=$(nproc)
@@ -172,6 +194,12 @@ dut_busy=$(awk -v d=$((cpu_b1 - cpu_b0)) -v t=$((cpu_t1 - cpu_t0)) -v n="$ncpu" 
 dut_softirq=$(awk -v d=$((cpu_sq1 - cpu_sq0)) -v t=$((cpu_t1 - cpu_t0)) -v n="$ncpu" \
     'BEGIN { printf "%.4f", (t > 0 ? d / t * n : 0) }')
 dut_loader=$(awk -v d=$((proc1 - proc0)) -v hz="$hz" 'BEGIN { printf "%.3f", d / hz }')
+dut_busiest=$(join /tmp/electrode-percore.0 /tmp/electrode-percore.1 | awk '
+    { db = $4 - $2; dt = $5 - $3; if (dt > 0) { p = db / dt * 100; if (p > m) { m = p; c = $1 } } }
+    END { printf "%.1f", m }')
+dut_busiest_cpu=$(join /tmp/electrode-percore.0 /tmp/electrode-percore.1 | awk '
+    { db = $4 - $2; dt = $5 - $3; if (dt > 0) { p = db / dt * 100; if (p > m) { m = p; c = $1 } } }
+    END { print c }')
 
 # Both copies go first. A run that fails leaves the previous one's log where
 # it was, and parsing that reports the last measurement again under this run's
@@ -188,4 +216,5 @@ python3 "$here/parse.py" \
     --threads "$threads" --client-procs "$client_procs" --warmup "$warmup" --rep "$rep" \
     --dut-busy-cores "$dut_busy" --dut-softirq-cores "$dut_softirq" \
     --dut-loader-cpu-s "$dut_loader" \
+    --dut-busiest-pct "$dut_busiest" --dut-busiest-cpu "${dut_busiest_cpu#cpu}" \
     ${out:+--out "$out"} /tmp/electrode-client.log

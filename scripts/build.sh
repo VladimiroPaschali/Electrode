@@ -36,11 +36,17 @@ build_one() {  # $1 = name, $2 = CXXFLAGS
 build_one baseline ""
 build_one tc "-DTC_BROADCAST"
 build_one xdp "-DXDP_BROADCAST"
+# The other half of Electrode: the leader's PrepareOK handling, in XDP. On its
+# own and on top of the broadcast offload, because the question is whether the
+# two are complementary -- the broadcast takes the sends off the leader and
+# leaves the receives, which is where the leader's time then goes.
+build_one prune "-DFAST_QUORUM_PRUNE"
+build_one xdp-prune "-DXDP_BROADCAST -DFAST_QUORUM_PRUNE"
 make clean >/dev/null 2>&1 || true
 
-echo "=== FastBroadCast, CLUSTER_SIZE=$n"
+echo "=== eBPF, CLUSTER_SIZE=$n"
 make -C xdp-handler clean >/dev/null
-make -C xdp-handler EXTRA_CFLAGS="-DCLUSTER_SIZE=$n" >/dev/null
+make -C xdp-handler EXTRA_CFLAGS="-DCLUSTER_SIZE=$n -DELECTRODE_XDP_OFFLOADS -DFAST_QUORUM_PRUNE" >/dev/null
 
 echo
 echo "built:"

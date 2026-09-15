@@ -44,10 +44,38 @@
 
 #include "fast_common.h"
 
+/* Where the pinned maps go.
+ *
+ * Not /sys/fs/bpf: `ip netns exec` gives each namespace a mount namespace of
+ * its own and remounts /sys inside it, which shadows the bpffs the root
+ * namespace has there. The pin fails, and a replica in another namespace could
+ * not have found it anyway. A bpffs mounted somewhere else is inherited by
+ * every namespace, and each replica gets a directory of its own because they
+ * all pin the same names.
+ */
+static const char *electrode_bpf_dir(void) {
+	const char *env = getenv("ELECTRODE_BPF_DIR");
+
+	if (env)
+		return env;
+	return access("/run/bpf", F_OK) == 0 ? "/run/bpf" : "/sys/fs/bpf";
+}
+
+static const char *electrode_pin(const char *name) {
+	static char buf[4][256];
+	static int n;
+	char *b = buf[n++ & 3];
+
+	snprintf(b, sizeof(buf[0]), "%s/%s", electrode_bpf_dir(), name);
+	return b;
+}
+
 static const char *ifname;
 static const char *config_path = "../config.txt";
 static const char *macs_path = "../config.macs";
 static int leader_idx = 0;
+static int want_xdp = 0;   /* -x: attach the XDP offloads too */
+static int want_tc = 1;    /* -T: leave the TC broadcast alone */
 
 static int ifindex;
 static struct bpf_object *obj;
@@ -57,6 +85,7 @@ static int tc_attached;
 
 #ifdef ELECTRODE_XDP_OFFLOADS
 static int xdp_attached;
+static __u32 xdp_mode;
 #endif
 
 /* Same layout as the map value in fast_kern.c. */
@@ -85,11 +114,13 @@ static void parse_cmdline(int argc, char *argv[]) {
 	ifname = argv[1];
 
 	optind = 2;
-	while ((opt = getopt(argc, argv, "c:m:l:")) != -1) {
+	while ((opt = getopt(argc, argv, "c:m:l:xT")) != -1) {
 		switch (opt) {
 		case 'c': config_path = optarg; break;
 		case 'm': macs_path = optarg; break;
 		case 'l': leader_idx = atoi(optarg); break;
+		case 'x': want_xdp = 1; break;
+		case 'T': want_tc = 0; break;
 		default: usage(argv[0]);
 		}
 	}
@@ -235,7 +266,7 @@ static void detach(void) {
 	}
 #ifdef ELECTRODE_XDP_OFFLOADS
 	if (xdp_attached) {
-		bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		bpf_xdp_detach(ifindex, xdp_mode, NULL);
 		xdp_attached = 0;
 	}
 #endif
@@ -275,9 +306,17 @@ int main(int argc, char *argv[]) {
 	bpf_program__set_type(tc_prog, BPF_PROG_TYPE_SCHED_CLS);
 
 #ifdef ELECTRODE_XDP_OFFLOADS
+	/* Only what this build actually contains: HandleRequest belongs to the
+	 * batching offload and WriteBuffer/PrepareFastReply to the fast reply.
+	 */
 	static const char *xdp_names[] = {
-	    "fastPaxos_main",      "HandlePrepare_main",  "HandlePrepareOK_main",
-	    "HandleRequest_main",  "WriteBuffer_main",    "PrepareFastReply_main",
+	    "fastPaxos_main", "HandlePrepare_main", "HandlePrepareOK_main",
+#ifdef FAST_BATCH
+	    "HandleRequest_main",
+#endif
+#ifdef FAST_REPLY
+	    "WriteBuffer_main", "PrepareFastReply_main",
+#endif
 	};
 	struct bpf_program *xdp_progs[sizeof(xdp_names) / sizeof(xdp_names[0])];
 
@@ -300,13 +339,18 @@ int main(int argc, char *argv[]) {
 	seed_ctr_state();
 
 #ifdef ELECTRODE_XDP_OFFLOADS
-	{
+	if (want_xdp) {
 		int map_xdp = bpf_object__find_map_fd_by_name(obj, "map_progs_xdp");
 		static const int idx[] = {-1, FAST_PROG_XDP_HANDLE_PREPARE,
 		                          FAST_PROG_XDP_HANDLE_PREPAREOK,
+#ifdef FAST_BATCH
 		                          FAST_PROG_XDP_HANDLE_REQUEST,
+#endif
+#ifdef FAST_REPLY
 		                          FAST_PROG_XDP_WRITE_BUFFER,
-		                          FAST_PROG_XDP_PREPARE_REPLY};
+		                          FAST_PROG_XDP_PREPARE_REPLY,
+#endif
+		};
 
 		for (size_t i = 1; i < sizeof(idx) / sizeof(idx[0]); i++) {
 			int fd = bpf_program__fd(xdp_progs[i]);
@@ -318,25 +362,51 @@ int main(int argc, char *argv[]) {
 			}
 		}
 
+#ifdef FAST_REPLY
 		assert(bpf_obj_pin(bpf_object__find_map_fd_by_name(obj, "map_prepare_buffer"),
-		                   "/sys/fs/bpf/paxos_prepare_buffer") == 0);
+		                   electrode_pin("paxos_prepare_buffer")) == 0);
+#endif
+#ifdef FAST_BATCH
 		assert(bpf_obj_pin(bpf_object__find_map_fd_by_name(obj, "map_request_buffer"),
-		                   "/sys/fs/bpf/paxos_request_buffer") == 0);
+		                   electrode_pin("paxos_request_buffer")) == 0);
+#endif
+		/* The replica reads leaderIdx and the quorum state from here. */
 		assert(bpf_obj_pin(bpf_object__find_map_fd_by_name(obj, "map_ctr_state"),
-		                   "/sys/fs/bpf/paxos_ctr_state") == 0);
+		                   electrode_pin("paxos_ctr_state")) == 0);
 
-		if (bpf_xdp_attach(ifindex, bpf_program__fd(xdp_progs[0]),
-		                   XDP_FLAGS_DRV_MODE, NULL)) {
-			fprintf(stderr, "Error: XDP attach on %s: %s\n", ifname, strerror(errno));
-			return 1;
+		/* Native first, then generic. Upstream only ever asked for native,
+		 * which a macvlan cannot do -- and a macvlan is what a replica has
+		 * when the cluster is a set of network namespaces on one machine.
+		 * Generic XDP runs after the skb is built, so it does not save the
+		 * allocation; it still takes the datagram before the socket queue,
+		 * the recvfrom and the protobuf parse, which is what this offload is
+		 * for.
+		 */
+		xdp_mode = XDP_FLAGS_DRV_MODE;
+		if (bpf_xdp_attach(ifindex, bpf_program__fd(xdp_progs[0]), xdp_mode, NULL)) {
+			xdp_mode = XDP_FLAGS_SKB_MODE;
+			if (bpf_xdp_attach(ifindex, bpf_program__fd(xdp_progs[0]), xdp_mode, NULL)) {
+				fprintf(stderr, "Error: XDP attach on %s: %s\n", ifname,
+				        strerror(errno));
+				return 1;
+			}
 		}
 		xdp_attached = 1;
-		printf("XDP attached to %s\n", ifname);
+		printf("XDP attached to %s (%s mode)\n", ifname,
+		       xdp_mode == XDP_FLAGS_DRV_MODE ? "native" : "generic");
 	}
 #endif
 
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
+
+	if (!want_tc) {
+		printf("pid %d\nready\n", (int)getpid());
+		fflush(stdout);
+		pause();
+		detach();
+		return 0;
+	}
 
 	memset(&tc_hook, 0, sizeof(tc_hook));
 	tc_hook.sz = sizeof(tc_hook);

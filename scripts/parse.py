@@ -31,6 +31,7 @@ FIELDS = ["variant", "replicas", "threads", "client_procs", "requests",
           "warmup", "rep", "throughput_kops", "median_us", "p90_us", "p95_us",
           "p99_us", "elapsed_s", "elapsed_spread", "clients_done",
           "dut_busy_cores", "dut_softirq_cores", "dut_loader_cpu_s",
+          "dut_busiest_pct", "dut_busiest_cpu",
           "ok", "note"]
 
 
@@ -50,6 +51,10 @@ def main():
     ap.add_argument("--dut-busy-cores", type=float, default=None)
     ap.add_argument("--dut-softirq-cores", type=float, default=None)
     ap.add_argument("--dut-loader-cpu-s", type=float, default=None)
+    # The busiest single core, which is what a narrow RSS indirection makes
+    # into the limit even while the machine as a whole looks idle.
+    ap.add_argument("--dut-busiest-pct", type=float, default=None)
+    ap.add_argument("--dut-busiest-cpu", default=None)
     ap.add_argument("--out")
     a = ap.parse_args()
 
@@ -66,9 +71,12 @@ def main():
                warmup=a.warmup, rep=a.rep, clients_done=len(done))
     for k, v in (("dut_busy_cores", a.dut_busy_cores),
                  ("dut_softirq_cores", a.dut_softirq_cores),
-                 ("dut_loader_cpu_s", a.dut_loader_cpu_s)):
+                 ("dut_loader_cpu_s", a.dut_loader_cpu_s),
+                 ("dut_busiest_pct", a.dut_busiest_pct)):
         if v is not None:
             row[k] = round(v, 4)
+    if a.dut_busiest_cpu:
+        row["dut_busiest_cpu"] = a.dut_busiest_cpu
 
     if not done:
         row["ok"] = 0
@@ -96,7 +104,8 @@ def main():
 
     print(",".join(f"{k}={row[k]}" for k in
                    ("variant", "replicas", "threads", "throughput_kops",
-                    "median_us", "p99_us", "dut_softirq_cores", "ok")))
+                    "median_us", "p99_us", "dut_softirq_cores",
+                    "dut_busiest_pct", "ok")))
 
     if a.out:
         new = not os.path.exists(a.out)

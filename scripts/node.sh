@@ -4,6 +4,7 @@
 #
 #   sudo ./node.sh start-replicas <variant> <n> 
 #   sudo ./node.sh start-tc <leaderIdx>
+#   sudo ./node.sh xdp-start <replicas>
 #   sudo ./node.sh client <variant> <requests> <clients> <warmup> <procs> <log>
 #   sudo ./node.sh stop
 #
@@ -53,7 +54,7 @@ cmd_start_replicas() {
     local variant=$1 n=$2 i core
     for (( i = 0; i < n; i++ )); do
         core=${REPLICA_CPU_LIST[$(( i % ${#REPLICA_CPU_LIST[@]} ))]}
-        ip netns exec "$NS-r$i" \
+        ip netns exec "$NS-r$i" env ELECTRODE_BPF_DIR="/run/bpf/r$i" \
             setsid taskset -c "$core" "$root/build/$variant/replica" \
                 -c "$root/config.txt" -m vr -i "$i" \
                 > "$run/replica$i.log" 2>&1 &
@@ -73,6 +74,51 @@ cmd_start_replicas() {
 # exactly as the leader's own stack would have resolved it -- a macvlan handed a
 # frame addressed to another macvlan on the same parent short-circuits it in
 # software, and the packet would never reach the wire.
+# A bpffs every namespace can see. `ip netns exec` remounts /sys inside a
+# mount namespace of its own, which shadows the one at /sys/fs/bpf; a mount
+# made here, in the root namespace, propagates into all of them.
+ensure_bpffs() {
+    mountpoint -q /run/bpf 2>/dev/null && return
+    mkdir -p /run/bpf
+    mount -t bpf bpf /run/bpf
+}
+
+# Electrode's other offload: the leader's PrepareOK handling, in XDP. Every
+# replica gets it, as upstream does, and a pin directory of its own -- they all
+# pin the same names.
+#
+# The TC program goes on with it, and not by choice. FastBroadCast clears the
+# quorum bitset whenever it sees a PREPARE leave, *before* its own
+# is_broadcast check, and HandlePrepareOK counts into that same bitset. Attach
+# the XDP half alone and the entry never matches the current (view, opnum), so
+# nothing is ever pruned -- and since FAST_QUORUM_PRUNE compiles the userspace
+# quorum count out, a leader that is handed every PrepareOK commits on the
+# first one. The two halves of Electrode are not separable.
+cmd_xdp_start() {
+    local n=$1 i
+    ensure_bpffs
+    # Old logs first: the readiness check counts files, and a bigger cluster's
+    # leftovers make it count "31 of 7".
+    rm -f "$run"/xdp*.log
+    for (( i = 0; i < n; i++ )); do
+        rm -rf "/run/bpf/r$i"; mkdir -p "/run/bpf/r$i"
+        ip netns exec "$NS-r$i" env ELECTRODE_BPF_DIR="/run/bpf/r$i" \
+            setsid "$root/xdp-handler/fast" "$DEV" -x \
+                -c "$root/config.txt" -m "$root/config.macs" -l 0 \
+            > "$run/xdp$i.log" 2>&1 &
+    done
+    sleep 2
+    local up
+    up=$(grep -l '^ready' "$run"/xdp*.log 2>/dev/null | wc -l)
+    [ "$up" -eq "$n" ] || {
+        echo "quorum prune up on $up of $n namespaces:" >&2
+        grep -h Error "$run"/xdp*.log | head -3 >&2
+        exit 1
+    }
+    grep -ho "(.* mode)" "$run/xdp0.log" | head -1
+    echo "quorum prune on $n namespaces"
+}
+
 cmd_start_tc() {
     local leader=${1:-0} gw_mac
     gw_mac=$(cat "$root/config.gwmac")
@@ -125,7 +171,7 @@ cmd_client() {
 }
 
 cmd_stop() {
-    local p
+    local p i
     for p in "$run"/*.pid; do
         [ -e "$p" ] || continue
         kill -TERM "$(cat "$p")" 2>/dev/null || true
@@ -137,6 +183,16 @@ cmd_stop() {
     pkill -f "$root/build/.*/replica" 2>/dev/null || true
     pkill -f "$root/build/.*/client" 2>/dev/null || true
     pkill -f "$root/xdp-handler/fast" 2>/dev/null || true
+    # `fast` detaches on SIGTERM, but not when it is killed outright, and an
+    # XDP program left on mv makes the next attach fail with "Exclusivity flag
+    # on, cannot modify".
+    for (( i = 0; i < 64; i++ )); do
+        ip netns list | awk '{print $1}' | grep -qx "$NS-r$i" || break
+        ip netns exec "$NS-r$i" ip link set dev "$DEV" xdpgeneric off 2>/dev/null || true
+        ip netns exec "$NS-r$i" ip link set dev "$DEV" xdp off 2>/dev/null || true
+    done
+    rm -f "$run"/xdp*.log
+    rm -rf /run/bpf/r[0-9]* 2>/dev/null || true
     sleep 0.3
     pkill -9 -f "$root/build/.*/replica" 2>/dev/null || true
     pkill -9 -f "$root/build/.*/client" 2>/dev/null || true
@@ -146,6 +202,7 @@ cmd_stop() {
 case "${1:-}" in
     start-replicas) shift; cmd_start_replicas "$@" ;;
     start-tc)       shift; cmd_start_tc "$@" ;;
+    xdp-start)      shift; cmd_xdp_start "$@" ;;
     client)         shift; cmd_client "$@" ;;
     stop)           cmd_stop ;;
     *) echo "usage: $0 {start-replicas <variant> <n>|start-tc <leader>|client ...|stop}" >&2; exit 1 ;;

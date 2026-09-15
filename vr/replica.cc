@@ -30,6 +30,22 @@
 
 #include "common/replica.h"
 #include "vr/replica.h"
+#include <unistd.h>
+
+/* Where the pinned maps live.
+ *
+ * Not /sys/fs/bpf: `ip netns exec` gives each namespace a mount namespace of
+ * its own and remounts /sys inside it, which shadows the bpffs the root
+ * namespace has there -- the pin then fails, and a replica in another
+ * namespace could not have found it anyway. A bpffs mounted somewhere else is
+ * inherited by every namespace, so both ends see the same one.
+ */
+static const char *electrode_bpf_dir(void) {
+    const char *env = getenv("ELECTRODE_BPF_DIR");
+    if (env) return env;
+    return access("/run/bpf", F_OK) == 0 ? "/run/bpf" : "/sys/fs/bpf";
+}
+
 #include "vr/vr-proto.pb.h"
 
 #include "lib/assert.h"
@@ -178,7 +194,7 @@ VRReplica::VRReplica(Configuration config, int myIdx,
     memset(sgn_bits, 0, sizeof(sgn_bits));
     sgn_bits[0] = (1<<31); // #define BROADCAST_SIGN_BIT (1<<31)
 #ifdef FAST_BATCH
-    request_buffer_fd = bpf_obj_get("/sys/fs/bpf/paxos_request_buffer");
+    request_buffer_fd = bpf_obj_get((std::string(electrode_bpf_dir()) + "/paxos_request_buffer").c_str());
     if (request_buffer_fd < 0) {
 		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name \"paxos_request_buffer\" failed\n");
 		exit(1); //return 1;
@@ -190,7 +206,7 @@ VRReplica::VRReplica(Configuration config, int myIdx,
 	}
 #endif
 #ifdef FAST_REPLY
-    prepare_buffer_fd = bpf_obj_get("/sys/fs/bpf/paxos_prepare_buffer");
+    prepare_buffer_fd = bpf_obj_get((std::string(electrode_bpf_dir()) + "/paxos_prepare_buffer").c_str());
     if (prepare_buffer_fd < 0) {
 		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name \"paxos_prepare_buffer\" failed\n");
 		exit(1); //return 1;
@@ -203,7 +219,7 @@ VRReplica::VRReplica(Configuration config, int myIdx,
 #endif
 
 #if defined FAST_REPLY || defined FAST_BATCH || defined FAST_QUORUM_PRUNE
-    paxos_ctr_state_fd = bpf_obj_get("/sys/fs/bpf/paxos_ctr_state");
+    paxos_ctr_state_fd = bpf_obj_get((std::string(electrode_bpf_dir()) + "/paxos_ctr_state").c_str());
     if (paxos_ctr_state_fd < 0) {
 		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name \"paxos_ctr_state\" failed\n");
 		exit(1); //return 1;

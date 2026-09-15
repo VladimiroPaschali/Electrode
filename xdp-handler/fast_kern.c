@@ -103,7 +103,7 @@ struct {
 
 
 
-#ifdef ELECTRODE_XDP_OFFLOADS
+#ifdef FAST_BATCH
 struct paxos_batch {
 	__u32 counter;
 	struct bpf_spin_lock lock;
@@ -123,7 +123,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 1 << 20);
 } map_request_buffer SEC(".maps");
-#endif
+#endif /* FAST_BATCH */
 
 
 static inline __u16 compute_ip_checksum(struct iphdr *ip) {
@@ -245,6 +245,11 @@ int fastPaxos_main(struct xdp_md *ctx) {
 }
 
 // This function will not be called, ignore.
+/* Batching only, and the one the verifier turns down on 6.14 -- it explores
+ * 1,000,001 instructions against a limit of 1,000,000. Nothing else needs it,
+ * so it is behind its own flag rather than dragging the others down with it.
+ */
+#ifdef FAST_BATCH
 SEC("HandleRequest")
 int HandleRequest_main(struct xdp_md *ctx) {
 	void *data_end = (void *)(long)ctx->data_end;
@@ -285,6 +290,8 @@ int HandleRequest_main(struct xdp_md *ctx) {
 	}
 	return XDP_DROP;
 }
+
+#endif /* FAST_BATCH */
 
 SEC("HandlePrepareOK")
 int HandlePrepareOK_main(struct xdp_md *ctx) {
@@ -356,6 +363,7 @@ int HandlePrepare_main(struct xdp_md *ctx) {
 }
 
 // currently we don't support reassembly, modify this in future if we want.
+#ifdef FAST_REPLY
 SEC("WriteBuffer")
 int WriteBuffer_main(struct xdp_md *ctx) {
 	void *data_end = (void *)(long)ctx->data_end;
@@ -444,6 +452,8 @@ int PrepareFastReply_main(struct xdp_md *ctx) {
 	return XDP_TX;
 }
 
+
+#endif /* FAST_REPLY */
 
 #endif /* ELECTRODE_XDP_OFFLOADS */
 

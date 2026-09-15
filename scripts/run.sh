@@ -11,6 +11,8 @@
 #   tc           on the leader's own TC egress hook (Electrode's offload)
 #   prune        nowhere, but Electrode's *other* offload is on: the leader's
 #                PrepareOKs are pruned in XDP before they reach userspace
+#   tc-prune     Electrode with both of its offloads, which is what its paper
+#                runs and the fair counterpart of xdp-prune
 #   xdp-prune    both, which is the question -- the broadcast takes the sends
 #                off the leader and the receives are what is left
 #   xdp          on this node, XDP_CLONE_TX, a page and a header per copy
@@ -62,10 +64,11 @@ case "$variant" in
     xdp)              cxx=xdp;        object=fanout.bpf.o ;;
     xdp-inline)       cxx=xdp;        object=fanout_inline.bpf.o ;;
     prune)            cxx=prune;      object=fanout.bpf.o ;;
+    tc-prune)         cxx=tc-prune;   object=fanout.bpf.o ;;
     xdp-prune)        cxx=xdp-prune;  object=fanout.bpf.o ;;
     xdp-inline-prune) cxx=xdp-prune;  object=fanout_inline.bpf.o ;;
     *) echo "variant must be baseline, tc, xdp, xdp-inline, prune," \
-            "xdp-prune or xdp-inline-prune" >&2; exit 1 ;;
+            "tc-prune, xdp-prune or xdp-inline-prune" >&2; exit 1 ;;
 esac
 
 rsh() { ssh "$GRECALE" "$@"; }
@@ -148,7 +151,7 @@ fi
 # Before the replicas: they open the pinned map at startup and give up if it
 # is not there.
 case "$variant" in
-    prune|xdp-prune|xdp-inline-prune)
+    prune|tc-prune|xdp-prune|xdp-inline-prune)
         rsh "sudo $REMOTE/scripts/node.sh xdp-start $replicas" >/dev/null ;;
 esac
 

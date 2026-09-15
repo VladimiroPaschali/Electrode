@@ -4,14 +4,19 @@
 #   sudo ./tune.sh on  <ifname>
 #   sudo ./tune.sh off <ifname>
 #
-# Two things, both of which otherwise show up in the latency and neither of
-# which is what this benchmark is about:
+# The governor, always: schedutil on an idle machine measures the governor.
 #
-#   interrupt coalescing  the mlx5 default adapts rx-usecs to the load, so a
-#                         quiet link answers late. Electrode's own setup turns
-#                         it off; without that a Paxos round trip carries tens
-#                         of microseconds of it.
-#   cpufreq governor      schedutil on an idle machine measures the governor.
+# Interrupt coalescing only when asked (COALESCE=off), and it is off by
+# default for a reason. Turning it off pins rx-usecs to 0 -- an interrupt per
+# packet -- which is right for a latency measurement on a quiet link and wrong
+# for a throughput one at scale. At thirty-one replicas on one machine the
+# cluster moves some 680,000 packets a second, and an interrupt for each of
+# them **halves the throughput**: 10.06 kops with coalescing off against 22.0
+# with the driver default, reproducibly, on the same configuration.
+#
+# Electrode's own setup disables it, but Electrode runs one replica per
+# machine, where per-packet interrupts are cheap. Thirty-one replicas sharing a
+# NIC is not that.
 #
 # The previous settings are saved under /var/tmp and restored by `off`, so
 # nothing here outlives the run.
@@ -32,19 +37,21 @@ governors() { ls /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/nu
 
 case "$action" in
 on)
-    if [ ! -e "$save.coalesce" ]; then
+    if [ "${COALESCE:-default}" = off ] && [ ! -e "$save.coalesce" ]; then
         ethtool -c "$dev" > "$save.coalesce" 2>/dev/null || true
     fi
     if [ ! -e "$save.governor" ]; then
         cat $(governors | head -1) > "$save.governor" 2>/dev/null || echo schedutil > "$save.governor"
     fi
 
-    ethtool -C "$dev" adaptive-rx off adaptive-tx off \
-        rx-usecs 0 rx-frames 1 tx-usecs 0 tx-frames 1 2>/dev/null \
-        || echo "warning: could not set coalescing on $dev" >&2
+    if [ "${COALESCE:-default}" = off ]; then
+        ethtool -C "$dev" adaptive-rx off adaptive-tx off \
+            rx-usecs 0 rx-frames 1 tx-usecs 0 tx-frames 1 2>/dev/null \
+            || echo "warning: could not set coalescing on $dev" >&2
+    fi
 
     for g in $(governors); do echo performance > "$g" 2>/dev/null || true; done
-    echo "tuned $dev: coalescing off, governor performance"
+    echo "tuned $dev: governor performance${COALESCE:+, coalescing $COALESCE}"
     ;;
 off)
     if [ -e "$save.coalesce" ]; then

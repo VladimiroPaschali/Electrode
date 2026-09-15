@@ -41,6 +41,10 @@ build_one xdp "-DXDP_BROADCAST"
 # two are complementary -- the broadcast takes the sends off the leader and
 # leaves the receives, which is where the leader's time then goes.
 build_one prune "-DFAST_QUORUM_PRUNE"
+# Electrode with both of its offloads on, which is what the paper runs and the
+# only fair counterpart of xdp-prune: the two then differ in where the
+# broadcast is duplicated and in nothing else.
+build_one tc-prune "-DTC_BROADCAST -DFAST_QUORUM_PRUNE"
 build_one xdp-prune "-DXDP_BROADCAST -DFAST_QUORUM_PRUNE"
 make clean >/dev/null 2>&1 || true
 

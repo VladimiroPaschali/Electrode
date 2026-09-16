@@ -18,5 +18,6 @@ config.macs.gw
 config.extra
 config.gwmac
 
-# Measurements
-results/
+# Measurements. One directory per sweep, named for the configuration it
+# measured; they are kept on disk, not in git.
+results*/

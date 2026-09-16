@@ -36,15 +36,9 @@ build_one() {  # $1 = name, $2 = CXXFLAGS
 build_one baseline ""
 build_one tc "-DTC_BROADCAST"
 build_one xdp "-DXDP_BROADCAST"
-# The other half of Electrode: the leader's PrepareOK handling, in XDP. On its
-# own and on top of the broadcast offload, because the question is whether the
-# two are complementary -- the broadcast takes the sends off the leader and
-# leaves the receives, which is where the leader's time then goes.
-build_one prune "-DFAST_QUORUM_PRUNE"
-# Electrode with both of its offloads on, which is what the paper runs and the
-# only fair counterpart of xdp-prune: the two then differ in where the
-# broadcast is duplicated and in nothing else.
-build_one tc-prune "-DTC_BROADCAST -DFAST_QUORUM_PRUNE"
+# The other half of Electrode, the leader's PrepareOK handling in XDP, on top
+# of the broadcast offload: the broadcast takes the sends off the leader and
+# the prune takes the receives, which is where its time then goes.
 build_one xdp-prune "-DXDP_BROADCAST -DFAST_QUORUM_PRUNE"
 make clean >/dev/null 2>&1 || true
 

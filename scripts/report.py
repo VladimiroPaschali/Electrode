@@ -12,10 +12,10 @@ import os
 import statistics as st
 from collections import defaultdict
 
-ORDER = ["baseline", "prune", "tc", "tc-prune", "xdp", "xdp-inline",
+ORDER = ["baseline", "tc", "xdp", "xdp-inline",
          "xdp-prune", "xdp-inline-prune"]
-LABEL = {"baseline": "baseline", "prune": "quorum prune",
-         "tc": "Electrode (TC)", "tc-prune": "Electrode both",
+LABEL = {"baseline": "baseline",
+         "tc": "Electrode (TC)",
          "xdp": "XDP\\_CLONE", "xdp-inline": "XDP\\_CLONE inline",
          "xdp-prune": "XDP\\_CLONE + prune",
          "xdp-inline-prune": "inline + prune"}

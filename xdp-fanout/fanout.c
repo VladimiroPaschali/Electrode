@@ -29,6 +29,8 @@ static const char *objpath = "fanout.bpf.o";
 static const char *config_path = "../config.txt";
 static const char *macs_path = "../config.macs";
 static char fanout_spec[64] = "";
+static char local_spec[64] = "";   /* -L <ip>:<port>: the replica served here */
+static int local_idx = -1;         /* -I <index>: which replica that is */
 
 static int ifindex;
 static struct bpf_object *obj;
@@ -53,7 +55,15 @@ static void usage(const char *argv0) {
           "  -o  BPF object: fanout.bpf.o (copy path) or fanout_inline.bpf.o\n"
           "  -c  replica list, Electrode's config.txt format\n"
           "  -m  one MAC per line, in the order of that file\n"
-          "  -e  a further host this node routes for, e.g. the client\n",
+          "  -e  a further host this node routes for, e.g. the client\n"
+          "  -L  address of a replica this node runs itself, <ip>:<port>\n"
+          "  -I  that replica's index in the configuration\n"
+          "\n"
+          "With -L/-I a broadcast becomes XDP_CLONE_PASS: the original goes up\n"
+          "this node's own stack to its replica and the copies are transmitted\n"
+          "to the rest, so the duplication point need not be a machine of its\n"
+          "own. It gives up the driver's shared page, which is offered only for\n"
+          "XDP_CLONE_TX; the WQE inline header still applies to every copy.\n",
           argv0);
   exit(EXIT_FAILURE);
 }
@@ -76,12 +86,14 @@ static void parse_cmdline(int argc, char *argv[]) {
   ifname = argv[1];
 
   optind = 2;
-  while ((opt = getopt(argc, argv, "f:o:c:m:e:")) != -1) {
+  while ((opt = getopt(argc, argv, "f:o:c:m:e:L:I:")) != -1) {
     switch (opt) {
     case 'f':
       snprintf(fanout_spec, sizeof(fanout_spec), "%s", optarg);
       break;
     case 'o': objpath = optarg; break;
+    case 'L': snprintf(local_spec, sizeof(local_spec), "%s", optarg); break;
+    case 'I': local_idx = atoi(optarg); break;
     case 'c': config_path = optarg; break;
     case 'm': macs_path = optarg; break;
     case 'e': {
@@ -230,6 +242,26 @@ static void fill_maps(void) {
 
   memset(&c, 0, sizeof(c));
   c.n_replicas = n;
+  c.local_idx = -1;
+  if (local_spec[0]) {
+    char buf[64], *lip, *lport;
+
+    if (local_idx < 0 || local_idx >= n) {
+      fprintf(stderr, "Error: -I wants an index in 0..%d\n", n - 1);
+      exit(EXIT_FAILURE);
+    }
+    snprintf(buf, sizeof(buf), "%s", local_spec);
+    lip = strtok(buf, ":");
+    lport = strtok(NULL, ":");
+    if (!lip || !lport || inet_pton(AF_INET, lip, &c.local_ip) != 1) {
+      fprintf(stderr, "Error: -L wants <ipv4>:<port>\n");
+      exit(EXIT_FAILURE);
+    }
+    c.local_port = htons(atoi(lport));
+    c.local_idx = local_idx;
+    printf("replica %d runs here, at %s:%s -- broadcasts are XDP_CLONE_PASS\n",
+           local_idx, lip, lport);
+  }
   ip = strtok(fanout_spec, ":");
   port = strtok(NULL, ":");
   if (!ip || !port || inet_pton(AF_INET, ip, &c.fanout_ip) != 1) {

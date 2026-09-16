@@ -37,7 +37,9 @@
 #include "axdp_tx.h"
 #include "fanout_common.h"
 
+#define __XDP_CLONE_PASS 5
 #define __XDP_CLONE_TX 6
+#define XDP_CLONE_PASS(num_copy) (((int)(num_copy) << 5) | (int)__XDP_CLONE_PASS)
 #define XDP_CLONE_TX(num_copy) (((int)(num_copy) << 5) | (int)__XDP_CLONE_TX)
 
 /* Every replica, in the order of the configuration file. */
@@ -218,13 +220,36 @@ static __always_inline int send_to_inline(struct xdp_md *ctx, struct hdrs *h,
  * @k runs 0 for the original and 1..count-1 for the copies; the sender's own
  * slot is skipped by shifting everything at or after it up by one.
  */
-static __always_inline struct fanout_peer *target_of(__u32 k, __s32 sender) {
-  __u32 i = k;
+/* The k-th replica that is neither @skip1 nor @skip2, as an index.
+ *
+ * Two skips rather than one because a node that serves a replica of its own
+ * takes that one with the original and leaves the rest to the copies: the
+ * sender is skipped because a broadcast is not sent back to its author, and
+ * the local replica because it is already served.
+ */
+static __always_inline int nth_other(const struct fanout_cfg *c, __u32 k,
+                                     __s32 skip1, __s32 skip2) {
+  __u32 seen = 0;
 
-  if (sender >= 0 && i >= (__u32)sender)
-    i++;
+#pragma clang loop unroll(disable)
+  for (int i = 0; i < FANOUT_MAX_PEERS; i++) {
+    if ((__u32)i >= c->n_replicas)
+      break;
+    if (i == skip1 || i == skip2)
+      continue;
+    if (seen == k)
+      return i;
+    seen++;
+  }
+  return -1;
+}
 
-  return bpf_map_lookup_elem(&replicas, &i);
+static __always_inline struct fanout_peer *peer_at(int idx) {
+  __u32 key = idx;
+
+  if (idx < 0)
+    return 0;
+  return bpf_map_lookup_elem(&replicas, &key);
 }
 
 /* The sender's replica index, or -1 if it is not a replica. The source address
@@ -263,7 +288,11 @@ int fanout(struct xdp_md *ctx) {
     if (parse_ip(ctx, &h) || parse_udp(ctx, &h))
       return XDP_DROP;
 
-    peer = target_of(idx, sender_idx(h.ip));
+    /* Copy k serves the k-th destination the original did not. Where this node
+     * runs a replica, the original went to it, so the copies start one along.
+     */
+    peer = peer_at(nth_other(c, c->local_idx >= 0 ? idx - 1 : idx,
+                             sender_idx(h.ip), c->local_idx));
     if (!peer)
       return XDP_DROP;
 
@@ -282,16 +311,34 @@ int fanout(struct xdp_md *ctx) {
 
   if (h.ip->daddr == c->fanout_ip && !parse_udp(ctx, &h) &&
       h.udp->dest == c->fanout_port) {
-    /* The broadcast. One packet in, one per recipient out: this one becomes
-     * the first recipient's frame and the clone action produces the rest.
-     */
+    /* The broadcast. One packet in, one per recipient out. */
     __s32 from = sender_idx(h.ip);
     __u32 count = c->n_replicas - (from >= 0 ? 1 : 0);
+    int local_is_a_recipient = c->local_idx >= 0 && c->local_idx != from;
 
     if (count == 0)
       return XDP_DROP;
 
-    peer = target_of(0, from);
+    if (local_is_a_recipient) {
+      /* The original is this node's own copy: readdress it to the replica here
+       * and let it up the stack, and the clones take the rest.
+       *
+       * This is the path that gives up the driver's shared page -- offered
+       * only for XDP_CLONE_TX -- and keeps the WQE inline header, which every
+       * copy still stamps for itself. XuDP is built the same way.
+       */
+      h.udp->dest = c->local_port;
+      h.udp->check = 0;
+      h.ip->daddr = c->local_ip;
+      h.ip->check = ip_checksum(h.ip);
+
+      if (count == 1)
+        return XDP_PASS;
+
+      return XDP_CLONE_PASS(count - 1);
+    }
+
+    peer = peer_at(nth_other(c, 0, from, c->local_idx));
     if (!peer)
       return XDP_DROP;
 
@@ -311,6 +358,10 @@ int fanout(struct xdp_md *ctx) {
 
     return XDP_CLONE_TX(count - 1);
   }
+
+  /* Addressed to the replica this node runs: up its own stack, not routed. */
+  if (c->local_idx >= 0 && h.ip->daddr == c->local_ip)
+    return XDP_PASS;
 
   /* Everything else in the cluster: route it on to its destination, so that
    * the baseline and the TC variant cross this node exactly like the two XDP

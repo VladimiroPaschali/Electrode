@@ -24,6 +24,14 @@ set -euo pipefail
 PARENT=${PARENT:-enp172s0f0np0}   # grecale's port on the link to maestrale
 FANOUT=${FANOUT:-192.168.101.1}   # maestrale, the DUT
 PORT=${PORT:-12345}
+# The address a leader built with -DXDP_BROADCAST sends its one packet to. A
+# port of its own, not the replica port: with the fan-out node also running a
+# replica the two would otherwise collide on the same address.
+FANOUT_PORT=${FANOUT_PORT:-12000}
+# With this set, the last replica of the cluster runs on the fan-out node
+# itself rather than in a namespace here -- the duplication point is then a
+# cluster member and not a machine the comparison needs on top.
+DUT_REPLICA=${DUT_REPLICA:-0}
 PREFIX=${PREFIX:-192.168.101}
 DEV=mv
 REPLICA_BASE=${REPLICA_BASE:-10}  # replica i is $PREFIX.$((REPLICA_BASE+i))
@@ -71,12 +79,14 @@ route_ns() {  # $1 = host octet, rest = the other host octets
 }
 
 cmd_up() {
-    local n=${1:?usage: cluster.sh up <replicas>} hosts=() i host
+    local n=${1:?usage: cluster.sh up <replicas>} hosts=() i host local_n
     [ "$n" -ge 1 ] || { echo "need at least one replica" >&2; exit 1; }
 
     cmd_down >/dev/null
 
-    for (( i = 0; i < n; i++ )); do hosts+=( $(( REPLICA_BASE + i )) ); done
+    # One fewer namespace when the fan-out node takes the last replica.
+    local_n=$(( DUT_REPLICA ? n - 1 : n ))
+    for (( i = 0; i < local_n; i++ )); do hosts+=( $(( REPLICA_BASE + i )) ); done
     hosts+=( "$CLIENT_HOST" )
 
     for host in "${hosts[@]}"; do make_ns "$host"; done
@@ -84,25 +94,8 @@ cmd_up() {
 
     # config.txt in Electrode's own format, and the MAC list beside it, so that
     # the replicas, the TC program and the fan-out node all agree on who is who.
-    {
-        echo "f $(( (n - 1) / 2 ))"
-        for (( i = 0; i < n; i++ )); do
-            echo "replica $(ip_of $(( REPLICA_BASE + i ))):$PORT"
-        done
-        # Where a leader built with -DXDP_BROADCAST sends its one packet. The
-        # directive is parsed by every build; only that one acts on it.
-        echo "fanout $FANOUT:$PORT"
-    } > "$root/config.txt"
-
-    : > "$root/config.macs"
-    for (( i = 0; i < n; i++ )); do mac_of $(( REPLICA_BASE + i )) >> "$root/config.macs"; done
-
-    # The client is not a replica, but the fan-out node routes for it too.
-    echo "$(ip_of "$CLIENT_HOST")=$(mac_of "$CLIENT_HOST")" > "$root/config.extra"
-
-    # Electrode's TC offload writes a destination MAC of its own into every
-    # clone; on this topology that has to be the fan-out node's, so resolve it
-    # once here rather than hardcoding it anywhere.
+    # The gateway MAC, resolved before the config is written: with the fan-out
+    # node taking a replica, that replica's MAC is the gateway's.
     ip netns exec "$NS-r0" ping -c 1 -W 2 "$FANOUT" >/dev/null 2>&1 || true
     ip netns exec "$NS-r0" ip neigh show "$FANOUT" | awk '{print $5; exit}' \
         > "$root/config.gwmac"
@@ -111,9 +104,28 @@ cmd_up() {
         exit 1
     fi
 
+    {
+        echo "f $(( (n - 1) / 2 ))"
+        for (( i = 0; i < local_n; i++ )); do
+            echo "replica $(ip_of $(( REPLICA_BASE + i ))):$PORT"
+        done
+        [ "$DUT_REPLICA" = 1 ] && echo "replica $FANOUT:$PORT"
+        # Where a leader built with -DXDP_BROADCAST sends its one packet. The
+        # directive is parsed by every build; only that one acts on it.
+        echo "fanout $FANOUT:$FANOUT_PORT"
+    } > "$root/config.txt"
+
+    : > "$root/config.macs"
+    for (( i = 0; i < local_n; i++ )); do mac_of $(( REPLICA_BASE + i )) >> "$root/config.macs"; done
+    [ "$DUT_REPLICA" = 1 ] && cat "$root/config.gwmac" >> "$root/config.macs"
+
+    # The client is not a replica, but the fan-out node routes for it too.
+    echo "$(ip_of "$CLIENT_HOST")=$(mac_of "$CLIENT_HOST")" > "$root/config.extra"
+
+
     hosts_write "${hosts[@]}"
 
-    echo "up: $n replicas + client"
+    echo "up: $n replicas + client${DUT_REPLICA:+$([ "$DUT_REPLICA" = 1 ] && echo " (the last on the fan-out node)")}"
     cmd_show
 }
 

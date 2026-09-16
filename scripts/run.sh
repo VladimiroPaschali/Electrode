@@ -4,24 +4,24 @@
 #
 #   ./run.sh --variant xdp --replicas 3 --requests 10000 --threads 4
 #
-# The four variants differ in exactly one thing, where the leader's broadcast is
+# The variants differ in exactly one thing, where the leader's broadcast is
 # duplicated:
 #
-#   baseline     nowhere: the leader sends one packet per follower
-#   tc           on the leader's own TC egress hook (Electrode's offload)
-#   prune        nowhere, but Electrode's *other* offload is on: the leader's
-#                PrepareOKs are pruned in XDP before they reach userspace
-#   tc-prune     Electrode with both of its offloads, which is what its paper
-#                runs and the fair counterpart of xdp-prune
-#   xdp-prune    both, which is the question -- the broadcast takes the sends
-#                off the leader and the receives are what is left
-#   xdp          on this node, XDP_CLONE_TX, a page and a header per copy
-#   xdp-inline   on this node, XDP_CLONE_TX with the descriptor stamped on the
-#                original, so every frame leaves from the one RX page and each
-#                copy's header reaches the NIC as the WQE inline header
+#   baseline          nowhere: the leader sends one packet per follower
+#   tc                on the leader's own TC egress hook (Electrode's offload)
+#   xdp               on this node, XDP_CLONE_TX, a page and a header per copy
+#   xdp-inline        on this node, XDP_CLONE_TX with the descriptor stamped on
+#                     the original, so every frame leaves from the one RX page
+#                     and each copy's header reaches the NIC as the WQE inline
+#                     header
+#   xdp-prune         xdp with Electrode's other offload on as well: the
+#                     leader's PrepareOKs are pruned in XDP before they reach
+#                     userspace, so the broadcast takes the sends off the
+#                     leader and the prune takes the receives
+#   xdp-inline-prune  the same, on the inline build
 #
-# In all four the packet crosses this node on its way to a follower, so the hop
-# count is the same and what the numbers compare is the duplication.
+# In all of them the packet crosses this node on its way to a follower, so the
+# hop count is the same and what the numbers compare is the duplication.
 
 set -euo pipefail
 
@@ -30,6 +30,20 @@ GRECALE=${GRECALE:-grecale}
 REMOTE=${REMOTE:-XDP_CLONE/electrode}
 PORT=${PORT:-12345}
 FANOUT_IP=${FANOUT_IP:-192.168.101.1}
+FANOUT_PORT=${FANOUT_PORT:-12000}
+REPLICA_PORT=${REPLICA_PORT:-12345}
+# With this set the last replica of the cluster runs here, on the fan-out node,
+# instead of in a namespace on the other machine: the duplication point is then
+# a cluster member rather than a server the comparison needs on top of the
+# baseline's. A broadcast becomes XDP_CLONE_PASS -- the original goes up this
+# node's own stack -- which gives up the driver's shared page and keeps the WQE
+# inline header.
+DUT_REPLICA=${DUT_REPLICA:-0}
+# All of grecale: the replicas get twenty-eight hardware threads and the
+# clients the last four. The point of giving the cluster the whole machine is
+# to stop it being the bottleneck, so that a DUT narrowed to one core can be.
+REPLICA_CPUS=${REPLICA_CPUS:-0-27}
+CLIENT_CPUS=${CLIENT_CPUS:-28-31}
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(dirname "$here")
@@ -63,12 +77,10 @@ case "$variant" in
     baseline|tc)      cxx=$variant;   object=fanout.bpf.o ;;
     xdp)              cxx=xdp;        object=fanout.bpf.o ;;
     xdp-inline)       cxx=xdp;        object=fanout_inline.bpf.o ;;
-    prune)            cxx=prune;      object=fanout.bpf.o ;;
-    tc-prune)         cxx=tc-prune;   object=fanout.bpf.o ;;
     xdp-prune)        cxx=xdp-prune;  object=fanout.bpf.o ;;
     xdp-inline-prune) cxx=xdp-prune;  object=fanout_inline.bpf.o ;;
-    *) echo "variant must be baseline, tc, xdp, xdp-inline, prune," \
-            "tc-prune, xdp-prune or xdp-inline-prune" >&2; exit 1 ;;
+    *) echo "variant must be baseline, tc, xdp, xdp-inline, xdp-prune" \
+            "or xdp-inline-prune" >&2; exit 1 ;;
 esac
 
 rsh() { ssh "$GRECALE" "$@"; }
@@ -90,6 +102,23 @@ preflight() {
         echo "mlx5_core is not loaded" >&2; exit 1; }
 }
 
+# The replica this node runs, when it does. It is the last index, so never the
+# leader: the leader has to send its broadcast *to* the duplication point.
+start_local_replica() {
+    [ "$DUT_REPLICA" = 1 ] || return 0
+    sudo setsid nohup taskset -c "${DUT_REPLICA_CPU:-3}" \
+        "$root/build/$cxx/replica" -c "$root/config.txt" -m vr \
+        -i "$(( replicas - 1 ))" > /tmp/electrode-local-replica.log 2>&1 < /dev/null &
+    sleep 1
+}
+
+stop_local_replica() {
+    local p
+    p=$(pgrep -x replica || true)
+    [ -n "$p" ] && sudo kill -9 $p 2>/dev/null || true
+    return 0
+}
+
 # By pid, never by pattern: pkill -f matches any process whose command line
 # contains the pattern, which includes the shell that invoked this script if
 # the pattern happens to appear in its arguments -- and killing the caller is
@@ -97,6 +126,7 @@ preflight() {
 fanout_pid=/tmp/electrode-fanout.pid
 
 cleanup() {
+    stop_local_replica
     rsh "sudo $REMOTE/scripts/node.sh stop" >/dev/null 2>&1 || true
     if [ -r "$fanout_pid" ]; then
         sudo kill -TERM "$(cat "$fanout_pid")" 2>/dev/null || true
@@ -120,7 +150,7 @@ preflight
 cleanup
 
 if [ "$keep_topology" = 0 ]; then
-    rsh "sudo $REMOTE/scripts/cluster.sh up $replicas" >/dev/null
+    rsh "sudo DUT_REPLICA=$DUT_REPLICA $REMOTE/scripts/cluster.sh up $replicas" >/dev/null
 fi
 
 # The topology's own generated files: the replica list, the MACs the fan-out
@@ -131,10 +161,17 @@ done
 
 # The fan-out node comes up first: it is the router for everything else, and
 # without it the namespaces cannot reach each other at all.
+# With DUT_REPLICA the last replica is this node's own: -L/-I tell the program
+# to keep the original for it instead of transmitting it.
+local_opts=()
+if [ "$DUT_REPLICA" = 1 ]; then
+    local_opts=(-L "$FANOUT_IP:$REPLICA_PORT" -I "$(( replicas - 1 ))")
+fi
+
 sudo setsid nohup "$root/xdp-fanout/fanout" "$ETH" \
-    -f "$FANOUT_IP:$PORT" -o "$root/xdp-fanout/$object" \
+    -f "$FANOUT_IP:$FANOUT_PORT" -o "$root/xdp-fanout/$object" \
     -c "$root/config.txt" -m "$root/config.macs" \
-    -e "$(cat "$root/config.extra")" \
+    -e "$(cat "$root/config.extra")" "${local_opts[@]}" \
     > /tmp/electrode-fanout.log 2>&1 < /dev/null &
 for _ in $(seq 50); do
     grep -q '^ready' /tmp/electrode-fanout.log && break
@@ -151,11 +188,17 @@ fi
 # Before the replicas: they open the pinned map at startup and give up if it
 # is not there.
 case "$variant" in
-    prune|tc-prune|xdp-prune|xdp-inline-prune)
-        rsh "sudo $REMOTE/scripts/node.sh xdp-start $replicas" >/dev/null ;;
+    xdp-prune|xdp-inline-prune)
+        # Only the namespaces on the other machine: with DUT_REPLICA the last
+        # replica lives here, and its interface already carries the fan-out
+        # program -- two XDP programs cannot share one interface. Its PREPAREs
+        # go through userspace, which costs it and nothing else.
+        rsh "sudo $REMOTE/scripts/node.sh xdp-start $(( DUT_REPLICA ? replicas - 1 : replicas ))" >/dev/null ;;
 esac
 
-rsh "sudo $REMOTE/scripts/node.sh start-replicas $cxx $replicas" >/dev/null
+start_local_replica
+rsh "sudo env REPLICA_CPUS='$REPLICA_CPUS' CLIENT_CPUS='$CLIENT_CPUS' \
+        $REMOTE/scripts/node.sh start-replicas $cxx $(( DUT_REPLICA ? replicas - 1 : replicas ))" >/dev/null
 sleep 1
 
 # What the DUT costs, measured across the whole client run.
@@ -184,7 +227,8 @@ percore_snapshot > /tmp/electrode-percore.0
 proc0=$(proc_cpu "$fpid")
 
 rsh "sudo rm -f /tmp/electrode-run/client.log" >/dev/null 2>&1 || true
-rsh "sudo $REMOTE/scripts/node.sh client $cxx $requests $threads $warmup $client_procs /tmp/electrode-run/client.log" || true
+rsh "sudo env REPLICA_CPUS='$REPLICA_CPUS' CLIENT_CPUS='$CLIENT_CPUS' \
+        $REMOTE/scripts/node.sh client $cxx $requests $threads $warmup $client_procs /tmp/electrode-run/client.log" || true
 
 read -r cpu_b1 cpu_sq1 cpu_t1 <<< "$(cpu_snapshot)"
 percore_snapshot > /tmp/electrode-percore.1

@@ -158,7 +158,13 @@ cmd_client() {
     rm -f "$log" "$log".* 2>/dev/null || true
     : > "$log"
     for (( j = 0; j < procs; j++ )); do
+        # A deadline, because a run that hangs otherwise hangs the whole sweep.
+        # It happens: at thirty-one replicas a straggler asks for a state
+        # transfer, the leader answers with a message in 1836 fragments, and
+        # the cluster livelocks -- upstream's own caveat about the non-critical
+        # path. parse.py reports the run as ok=0, which is what it is.
         ip netns exec "$NS-cl" \
+            timeout "${CLIENT_TIMEOUT:-300}" \
             taskset -c "${CLIENT_CPU_LIST[$(( j % ${#CLIENT_CPU_LIST[@]} ))]}" \
                 "$root/build/$variant/client" \
                 -c "$root/config.txt" -m vr -n "$requests" -t "$per" -w "$warmup" \

@@ -57,11 +57,15 @@ total=$(( ${#replicas[@]} * ${#variants[@]} * ${#threads[@]} * reps ))
 i=0
 
 for n in "${replicas[@]}"; do
-    # FastBroadCast has its cluster size compiled in, so the TC object is the
-    # one thing that has to be rebuilt when it changes.
+    # The eBPF object has its cluster size compiled in, so it is the one thing
+    # that has to be rebuilt when that changes. The offload flags have to match
+    # scripts/build.sh: without them the object carries no XDP programs and
+    # every prune variant fails, which is what "(run failed)" was.
     ssh "$GRECALE" "make -C $REMOTE/xdp-handler clean >/dev/null && \
-                    make -C $REMOTE/xdp-handler EXTRA_CFLAGS=-DCLUSTER_SIZE=$n >/dev/null"
-    ssh "$GRECALE" "sudo $REMOTE/scripts/cluster.sh up $n" >/dev/null
+                    make -C $REMOTE/xdp-handler \
+                        EXTRA_CFLAGS='-DCLUSTER_SIZE=$n -DELECTRODE_XDP_OFFLOADS -DFAST_QUORUM_PRUNE' \
+                        >/dev/null"
+    ssh "$GRECALE" "sudo DUT_REPLICA=${DUT_REPLICA:-0} $REMOTE/scripts/cluster.sh up $n" >/dev/null
 
     for rep in $(seq 1 "$reps"); do
         for v in "${variants[@]}"; do

@@ -46,11 +46,12 @@ DEFINE_LATENCY(op);
 
 BenchmarkClient::BenchmarkClient(Client &client, Transport &transport,
                                  int numRequests, uint64_t delay,
-                                 int warmupSec,
+                                 int warmupSec, int durationSec,
                                  string latencyFilename)
     : client(client), transport(transport),
       numRequests(numRequests), delay(delay),
-      warmupSec(warmupSec), latencyFilename(latencyFilename)
+      warmupSec(warmupSec), durationSec(durationSec),
+      latencyFilename(latencyFilename)
 {
     if (delay != 0) {
         Notice("Delay between requests: %" PRIu64 " ms", delay);        
@@ -58,6 +59,9 @@ BenchmarkClient::BenchmarkClient(Client &client, Transport &transport,
     started = false;
     done = false;
     cooldownDone = false;
+    if (durationSec > 0) {
+        Notice("Measuring for %d seconds", durationSec);
+    }
     _Latency_Init(&latency, "op");
     latencies.reserve(numRequests);
 }
@@ -80,6 +84,10 @@ BenchmarkClient::WarmupDone()
            warmupSec, n);
     gettimeofday(&startTime, NULL);
     n = 0;
+    if (durationSec > 0) {
+        transport.Timer(durationSec * 1000,
+                        std::bind(&BenchmarkClient::Finish, this));
+    }
 }
 
 void
@@ -89,6 +97,10 @@ BenchmarkClient::CooldownDone()
     char buf[1024];
     cooldownDone = true;
     Notice("Finished cooldown period.");
+    if (latencies.empty()) {
+        Warning("No request completed inside the measurement window");
+        return;
+    }
     std::sort(latencies.begin(), latencies.end());
 
     uint64_t ns = latencies[latencies.size()/2];
@@ -131,7 +143,7 @@ BenchmarkClient::OnReply(const string &request, const string &reply)
     if ((started) && (!done) && (n != 0)) {
         uint64_t ns = Latency_End(&latency);
         latencies.push_back(ns);
-        if (n > numRequests) {
+        if (durationSec == 0 && n > numRequests) {
             Finish();
         }
     }
@@ -149,12 +161,22 @@ BenchmarkClient::OnReply(const string &request, const string &reply)
 void
 BenchmarkClient::Finish()
 {
+    /* The timer and the request count can both reach here, and in duration
+     * mode the timer can fire while a Finish is already done. */
+    if (done) {
+        return;
+    }
+
     gettimeofday(&endTime, NULL);
     
     struct timeval diff = timeval_sub(endTime, startTime);
 
-    Notice("Completed %d requests in " FMT_TIMEVAL_DIFF " seconds",
-           numRequests, VA_TIMEVAL_DIFF(diff));
+    /* The requests actually measured, not the number asked for: in duration
+     * mode they are not the same, and in request mode this is the same number
+     * to within the one in flight when the count was reached.
+     */
+    Notice("Completed %zu requests in " FMT_TIMEVAL_DIFF " seconds",
+           latencies.size(), VA_TIMEVAL_DIFF(diff));
     done = true;
 
     transport.Timer(warmupSec * 1000,

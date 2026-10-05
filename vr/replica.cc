@@ -30,6 +30,7 @@
 
 #include "common/replica.h"
 #include "vr/replica.h"
+#include <stdlib.h>
 #include <unistd.h>
 
 /* Where the pinned maps live.
@@ -44,6 +45,27 @@ static const char *electrode_bpf_dir(void) {
     const char *env = getenv("ELECTRODE_BPF_DIR");
     if (env) return env;
     return access("/run/bpf", F_OK) == 0 ? "/run/bpf" : "/sys/fs/bpf";
+}
+
+/* Dead weight to hang on the broadcast, in bytes, for the runs that ask what
+ * it costs to duplicate a large packet rather than a small one. The benchmark's
+ * request is "request<n>", so the PREPARE the fan-out node copies is 152 bytes
+ * on the wire, and at that size the shared-page build saves a memcpy too small
+ * to find in a throughput number. Only the PREPARE is padded -- the client's
+ * requests and the replies stay what they always were -- so a sweep at two
+ * paddings varies the duplicated packet and nothing else.
+ *
+ * The ceiling is the MTU. A padded PREPARE that does not fit in one frame is
+ * fragmented by IP, and the fan-out program recognises a broadcast by its UDP
+ * destination port, which only the first fragment carries: the rest would go up
+ * that node's own stack and the followers would simply stop hearing PREPARE.
+ * Refusing at startup is the same bargain as the two ethtool flags.
+ */
+#define ELECTRODE_MAX_PREPARE_PAD 1200
+
+static size_t electrode_prepare_pad(void) {
+    const char *env = getenv("ELECTRODE_PREPARE_PAD");
+    return env ? strtoul(env, NULL, 10) : 0;
 }
 
 #include "vr/vr-proto.pb.h"
@@ -147,6 +169,17 @@ VRReplica::VRReplica(Configuration config, int myIdx,
 
     if (batchSize > 1) {
         Notice("Batching enabled; batch size %d", batchSize);
+    }
+
+    preparePad = electrode_prepare_pad();
+    if (preparePad > ELECTRODE_MAX_PREPARE_PAD) {
+        Panic("ELECTRODE_PREPARE_PAD is %zu, above the %d bytes that still fit "
+              "in one frame; IP would fragment the PREPARE and the fan-out node "
+              "recognises only the first fragment as a broadcast",
+              preparePad, ELECTRODE_MAX_PREPARE_PAD);
+    }
+    if (preparePad > 0) {
+        Notice("PREPARE padded to carry %zu bytes of dead weight", preparePad);
     }
 
     // If we don't hear from leader for a period of time, then do the view change.
@@ -526,6 +559,13 @@ void VRReplica::CloseBatch() {
         ASSERT(entry->viewstamp.view == view);
         ASSERT(entry->viewstamp.opnum == i);
         *r = entry->request;
+    }
+    /* The padding rides on every PREPARE, resends included: lastPrepare is what
+     * ResendPrepare() sends, and a resend that was suddenly small would be the
+     * one packet of the run measuring something else.
+     */
+    if (preparePad > 0) {
+        p.set_padding(string(preparePad, 'x'));
     }
     lastPrepare = p;
 

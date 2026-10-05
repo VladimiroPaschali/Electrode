@@ -26,10 +26,13 @@ copies leave from there.
                       └───────▲──────────────────────┬───────────────┘
                               │ 1 packet             │ n packets
     ┌─────────────────────────┴──────────────────────▼─────────────────┐
-    │ grecale: one netns per replica, one for the client                │
-    │   elec-r0 .10   elec-r1 .11   elec-r2 .12   elec-cl .200          │
+    │ grecale: one netns per replica                                    │
+    │   elec-r0 .10   elec-r1 .11   elec-r2 .12                         │
     └───────────────────────────────────────────────────────────────────┘
 ```
+
+The clients run on maestrale, beside the fan-out program; see *Saturating the
+fan-out node*.
 
 ## The four points
 
@@ -296,8 +299,11 @@ a PREPARE leave, *before* its own `is_broadcast` check. `HandlePrepareOK`, the
 the entry never matches the current (view, opnum), so nothing is pruned — and
 since `FAST_QUORUM_PRUNE` compiles the userspace quorum count out, a leader
 handed every PrepareOK commits on the first one. The leader then sits in
-`ResendPrepare` for ever. Both halves go on together, which is what
-`scripts/node.sh xdp-start` does.
+`ResendPrepare` for ever. Both halves have to go on together.
+
+(The harness has since been cut down to the four broadcast points, so it no
+longer starts either half: the numbers in this section were measured with
+`scripts/node.sh xdp-start`, which was removed with them.)
 
 ### What it took to run them at all
 
@@ -315,6 +321,98 @@ handed every PrepareOK commits on the first one. The leader then sits in
   another namespace could not have found the pin anyway. A bpffs at `/run/bpf`
   is inherited by all of them, one directory per replica since they pin the
   same names.
+
+## Saturating the fan-out node
+
+The comparison between `xdp` and `xdp-inline` only means something while the
+core doing the duplication has none to spare, and for a long time it had
+plenty: maestrale's busiest core was 94-99% idle, and the two came out the same
+everywhere. Two things were in the way, and both are fixed here.
+
+**Grecale could not offer enough load.** With every replica *and* every client
+on the one machine, the cluster saturated grecale long before it saturated the
+duplication. The clients moved to maestrale, which has thirty-one cores that
+are not the fan-out's (`CLIENTS_ON_DUT=1`, the default; `0` restores the old
+topology, which `scripts/verify.sh` still wants). Nothing in the eBPF had to
+change: the program already passes anything addressed to the local address that
+is not the fan-out port, which is exactly what a client's replies are. Hop
+parity is untouched — client traffic takes the same path in all four variants,
+and replica-to-replica traffic still crosses the fan-out node.
+
+**Narrowing the DUT to one core stopped meaning what it meant.**
+`dut-cores.sh one` put everything the interface received on a single core,
+which was right while the only thing arriving was cluster traffic to be routed.
+With the clients here it is not: their replies are `XDP_PASS`es — an skb, the
+UDP stack, a socket wakeup each — and a core shared with them saturates on the
+clients while reporting it as the cost of duplicating. `dut-cores.sh fanout`
+steers UDP/12000, the broadcast and nothing else, to queue 0 with an ntuple
+rule, spreads the rest over queues 1..n-1, and moves the other queues'
+interrupts off that core — the default assignment puts `comp1` on cpu 1 beside
+`comp0`.
+
+**And the measurement was of the wrong core.** `dut_busiest_pct` reported the
+busiest core on the DUT, which with `DUT_REPLICA=1` is the local replica's:
+`results16_in_comp` names cpu 3 — `DUT_REPLICA_CPU` — in 70 of the 72 rows of
+each XDP point, and wanders elsewhere in the rest, which is the other half of
+the complaint: it was not tracking any particular core. The
+core to measure is the one taking the interface's completion interrupts, and
+`run.sh` now diffs `/proc/interrupts` across the run to name it —
+`fanout_cpu`, `fanout_busy_pct`, `fanout_softirq_pct`, and `fanout_irq_share`,
+which says whether there was a single such core at all.
+
+## How big the packet being duplicated is
+
+Nothing in the benchmark ever asked. `BenchmarkClient::SendNext()` sends
+`"request" << n`, a dozen bytes, and the replica runs with the default batch
+size of one, so the PREPARE the fan-out node copies is **152 bytes on the
+wire** — 42 of Ethernet, IP and UDP, 65 of `SerializeMessage()`'s framing (the
+magic word, the 33-character type name, the twelve bytes Electrode's XDP half
+reads, two lengths), and some forty-five of protobuf. The copy the non-inline
+build makes is that plus the headroom, about 400 bytes of `memcpy`. That is the
+second half of why `xdp` and `xdp-inline` come out the same here: not only does
+the fan-out core have headroom, the thing the shared page saves is 400 bytes.
+
+`--payload N` on `run.sh` and `sweep.sh` hangs N bytes of dead weight on the
+PREPARE and on nothing else — the replicas take it as `ELECTRODE_PREPARE_PAD`,
+`CloseBatch()` fills a `padding` field the followers ignore. The client's
+requests and the replies stay the size they always were, so a sweep at two
+paddings varies the duplicated packet and nothing else. At 1024 the PREPARE
+arriving at a follower measures 1165 bytes on the wire, confirmed with
+`tcpdump` inside `elec-r1`, and the null COMMITs beside it stay at 110.
+
+The ceiling is the MTU, and the replica refuses a padding above 1200 bytes
+rather than measure what happens past it: IP would fragment the PREPARE, and
+the fan-out program recognises a broadcast by its UDP destination port, which
+only the first fragment carries. The rest would go up the DUT's own stack and
+the followers would simply stop hearing PREPARE.
+
+The answer, from a sweep at 1024 over all five cluster sizes with one
+repetition (`results_payload/`), is that **it changes nothing that can be
+measured here**. Peak throughput against the baseline's, beside the archived
+sweep at no padding (`results16_out_comp`, three repetitions, and only to 32
+clients):
+
+| replicas | TC, 0 B | TC, 1024 B | `xdp`, 0 B | `xdp`, 1024 B | inline, 0 B | inline, 1024 B |
+|---|---|---|---|---|---|---|
+| 3  | 1.02x | 1.05x | 1.13x | 1.20x | 1.14x | 1.21x |
+| 7  | 1.23x | 1.25x | 1.69x | 1.72x | 1.69x | 1.74x |
+| 15 | 1.34x | 1.36x | 2.07x | 2.07x | 2.08x | 2.05x |
+| 31 | 1.46x | 1.45x | 2.30x | 2.25x | 2.30x | 2.27x |
+
+Eight times the bytes on the duplicated packet, and the same ratios to within
+the spread of a single repetition. What the offload takes off the leader is a
+`sendto()` per follower, and that cost is per packet, not per byte, at any size
+that fits in a frame. The two XDP points stay within 3% of each other in both
+directions — 1.21x against 1.20x at three replicas, 2.05x against 2.07x at
+fifteen — so the shared page still has nothing to show: the fan-out core peaks
+at 18% busy, and what the inline build saves is a `memcpy` on a core that is
+idle 82% of the time. That difference belongs to `microbenchmark/`, which
+measures the node rather than the cluster.
+
+Where the padding does show is the DUT as a whole. At 31 replicas the baseline
+has it in softirq for 1.14 cores against the XDP points' 0.39, because the
+baseline's thirty 1.2-kB frames cross it in both directions while the XDP
+points' one does.
 
 ## Known limits
 
@@ -336,3 +434,35 @@ handed every PrepareOK commits on the first one. The leader then sits in
   size.
 - **View changes are not handled**, upstream's own caveat. A run in which one
   happens is reported with `ok=0` rather than as a measurement.
+- **The two machines did not agree on the MTU, and a replica that fell behind
+  could never catch up.** grecale's interface and every macvlan on it were at
+  9000; the DUT is at 1500. `UDPTransport` fragments only above
+  `MAX_UDP_MESSAGE_SIZE`, which is 9000, so any message between the MTU and
+  that — in practice the state transfer a straggler asks for — left grecale as
+  one oversize frame, and since all replica-to-replica traffic is routed through
+  the DUT, the DUT's NIC dropped it at the PHY. 50 such 9010-byte frames left
+  the leader in one 25-second run and `rx_oversize_pkts_phy` on maestrale
+  counted 104 (the other replicas send them too); in another run the leader sent
+  29,586 of them, to a follower that was never going to receive one. The
+  follower asks again, for ever. With three replicas a run survives one
+  straggler and measures nothing when both fall behind: at 128 clients and 1024
+  bytes of padding, four attempts out of six ended with the leader looping in
+  `ResendPrepare` and every client completing zero requests. It was never a
+  property of any variant — padding only makes a straggler more likely — and it
+  is the real mechanism behind the state-transfer livelock at 31 replicas that
+  `scripts/node.sh` warns about.
+
+  **grecale was set to 1500 on 2026-09-22** (`sudo ip link set
+  enp172s0f0np0 mtu 1500`; the macvlans follow the parent down). The kernel then
+  fragments at 1500 instead, and the fragments cross the DUT because the fan-out
+  program's routing half never looks at the UDP header — only the broadcast half
+  does, and a broadcast is one frame. The point that had stalled four times out
+  of six came back at 80.3 kops with the leader at 100% and no oversize frames
+  at all, and the sweep in `results_payload/` is the first in this tree in which
+  all 140 runs, 31 replicas included, are `ok=1`. Everything archived before
+  that date was measured with the mismatch in place, so any run of theirs at 15
+  or 31 replicas may have been carrying stragglers that were never coming back.
+  The alternative fix, fragmenting below the DUT's MTU in
+  `lib/udptransport.cc`, was not needed once the link agreed with itself; and
+  the other experiments in the tree now see a 1500-byte grecale, which is a
+  change to put back deliberately rather than to discover.

@@ -19,9 +19,14 @@ fanout_ip=${4:?fanout ip}
 port=${5:?port}
 n=${6:-3}
 
+# The client runs here, in its own namespace, so this check needs the topology
+# that puts it here. Where the broadcast is duplicated is the same either way,
+# so verifying in that topology says as much about the offloads -- but the
+# namespace has to exist.
 for ns in $(for ((i = 0; i < n; i++)); do echo "elec-r$i"; done) elec-cl; do
     if ! ip netns list | awk '{print $1}' | grep -qx "$ns"; then
-        echo "no namespace $ns -- run 'sudo scripts/cluster.sh up 3' first" >&2
+        echo "no namespace $ns -- bring the cluster up with the client here:" >&2
+        echo "  sudo CLIENTS_ON_DUT=0 scripts/cluster.sh up $n" >&2
         exit 1
     fi
 done

@@ -77,6 +77,9 @@ private:
                         proto::PrepareMessage> > pendingPrepares;
     proto::PrepareMessage lastPrepare;
     int batchSize;
+    // ELECTRODE_PREPARE_PAD: bytes of dead weight on the PREPARE, the one
+    // message the fan-out node duplicates. Zero unless a run asks for it.
+    size_t preparePad;
     opnum_t lastBatchEnd;
     bool batchComplete;
 

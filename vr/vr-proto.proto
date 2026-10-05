@@ -26,6 +26,13 @@ message PrepareMessage {
     required uint64 opnum = 2;
     required uint64 batchstart = 3;
     repeated Request request = 4;
+    // Dead weight, on the one message the fan-out duplicates. The benchmark's
+    // request is "request<n>", so without it the frame being copied is 152
+    // bytes and the copy the non-inline build makes is 400 with the headroom --
+    // too little for the shared page to save anything a run can see. Filled by
+    // VRReplica::CloseBatch() from ELECTRODE_PREPARE_PAD, and by nothing else,
+    // so the client's own traffic stays the size it always was.
+    optional bytes padding = 5;
 }
 
 message PrepareOKMessage {

@@ -4,8 +4,9 @@
 #
 #   sudo ./node.sh start-replicas <variant> <n> 
 #   sudo ./node.sh start-tc <leaderIdx>
-#   sudo ./node.sh xdp-start <replicas>
-#   sudo ./node.sh client <variant> <requests> <clients> <warmup> <procs> <log>
+#   sudo ./node.sh leader-cpu [idx]
+#   sudo ./node.sh sample-cpu <idx> <outfile>
+#   sudo ./node.sh client <variant> <requests> <clients> <warmup> <procs> <log> [duration]
 #   sudo ./node.sh stop
 #
 # Everything runs inside the namespaces cluster.sh made, so every packet between
@@ -50,11 +51,16 @@ read -ra CLIENT_CPU_LIST <<< "$(expand_cpus "$CLIENT_CPUS")"
 
 mkdir -p "$run"
 
+# PREPARE_PAD travels to the replicas as ELECTRODE_PREPARE_PAD: dead weight the
+# leader hangs on the PREPARE, which is the one message the fan-out node
+# duplicates. It is set on every replica and not just the leader, because any of
+# them can become one.
 cmd_start_replicas() {
     local variant=$1 n=$2 i core
     for (( i = 0; i < n; i++ )); do
         core=${REPLICA_CPU_LIST[$(( i % ${#REPLICA_CPU_LIST[@]} ))]}
         ip netns exec "$NS-r$i" env ELECTRODE_BPF_DIR="/run/bpf/r$i" \
+            ELECTRODE_PREPARE_PAD="${PREPARE_PAD:-0}" \
             setsid taskset -c "$core" "$root/build/$variant/replica" \
                 -c "$root/config.txt" -m vr -i "$i" \
                 > "$run/replica$i.log" 2>&1 &
@@ -74,51 +80,6 @@ cmd_start_replicas() {
 # exactly as the leader's own stack would have resolved it -- a macvlan handed a
 # frame addressed to another macvlan on the same parent short-circuits it in
 # software, and the packet would never reach the wire.
-# A bpffs every namespace can see. `ip netns exec` remounts /sys inside a
-# mount namespace of its own, which shadows the one at /sys/fs/bpf; a mount
-# made here, in the root namespace, propagates into all of them.
-ensure_bpffs() {
-    mountpoint -q /run/bpf 2>/dev/null && return
-    mkdir -p /run/bpf
-    mount -t bpf bpf /run/bpf
-}
-
-# Electrode's other offload: the leader's PrepareOK handling, in XDP. Every
-# replica gets it, as upstream does, and a pin directory of its own -- they all
-# pin the same names.
-#
-# The TC program goes on with it, and not by choice. FastBroadCast clears the
-# quorum bitset whenever it sees a PREPARE leave, *before* its own
-# is_broadcast check, and HandlePrepareOK counts into that same bitset. Attach
-# the XDP half alone and the entry never matches the current (view, opnum), so
-# nothing is ever pruned -- and since FAST_QUORUM_PRUNE compiles the userspace
-# quorum count out, a leader that is handed every PrepareOK commits on the
-# first one. The two halves of Electrode are not separable.
-cmd_xdp_start() {
-    local n=$1 i
-    ensure_bpffs
-    # Old logs first: the readiness check counts files, and a bigger cluster's
-    # leftovers make it count "31 of 7".
-    rm -f "$run"/xdp*.log
-    for (( i = 0; i < n; i++ )); do
-        rm -rf "/run/bpf/r$i"; mkdir -p "/run/bpf/r$i"
-        ip netns exec "$NS-r$i" env ELECTRODE_BPF_DIR="/run/bpf/r$i" \
-            setsid "$root/xdp-handler/fast" "$DEV" -x \
-                -c "$root/config.txt" -m "$root/config.macs" -l 0 \
-            > "$run/xdp$i.log" 2>&1 &
-    done
-    sleep 2
-    local up
-    up=$(grep -l '^ready' "$run"/xdp*.log 2>/dev/null | wc -l)
-    [ "$up" -eq "$n" ] || {
-        echo "quorum prune up on $up of $n namespaces:" >&2
-        grep -h Error "$run"/xdp*.log | head -3 >&2
-        exit 1
-    }
-    grep -ho "(.* mode)" "$run/xdp0.log" | head -1
-    echo "quorum prune on $n namespaces"
-}
-
 cmd_start_tc() {
     local leader=${1:-0} gw_mac
     gw_mac=$(cat "$root/config.gwmac")
@@ -138,6 +99,48 @@ cmd_start_tc() {
     echo "FastBroadCast did not come up:" >&2; cat "$run/tc.log" >&2; exit 1
 }
 
+# What the leader costs, which is the resource the whole comparison is about:
+# the offloads take work off the leader's core, so a run in which that core is
+# not saturated is a run whose bottleneck is somewhere else and whose numbers
+# say nothing about the offload.
+#
+# Prints, for replica <idx>: the process's own ticks, then its core's busy and
+# total ticks. Two of these around the client run give both the share of the
+# core the replica itself used and what the core did altogether -- and since a
+# core's total ticks *are* its wall time, neither needs a clock.
+cmd_leader_cpu() {
+    local idx=${1:-0} pid core t b tot
+    core=${REPLICA_CPU_LIST[$(( idx % ${#REPLICA_CPU_LIST[@]} ))]}
+    pid=$(cat "$run/replica$idx.pid" 2>/dev/null || echo "")
+    t=0
+    if [ -n "$pid" ] && [ -r "/proc/$pid/stat" ]; then
+        # utime + stime. The comm field holds no spaces for "replica", so the
+        # field numbers are not shifted.
+        t=$(awk '{print $14 + $15}' "/proc/$pid/stat")
+    fi
+    read -r b tot <<< "$(awk -v c="cpu$core" \
+        '$1 == c { print $2+$3+$4+$7+$8+$9, $2+$3+$4+$5+$6+$7+$8+$9 }' /proc/stat)"
+    echo "$t ${b:-0} ${tot:-0} $core"
+}
+
+# The same numbers once a second, until killed. Averaging over the whole client
+# run understates the leader badly: the window also holds the client processes
+# starting, the warmup ramp and the tail where the early clients have finished
+# and the load has fallen away. Measured over the whole window the leader's
+# core reads 78%; sampled in the middle of the same run it is at 99%. Only the
+# second answers the question the experiment asks, which is whether the run was
+# leader-bound at all.
+cmd_sample_cpu() {
+    local idx=${1:-0} out=${2:?outfile} pid core
+    core=${REPLICA_CPU_LIST[$(( idx % ${#REPLICA_CPU_LIST[@]} ))]}
+    pid=$(cat "$run/replica$idx.pid" 2>/dev/null || echo "")
+    : > "$out"
+    while :; do
+        cmd_leader_cpu "$idx" >> "$out"
+        sleep 1
+    done
+}
+
 # One client process saturates a core well before the cluster saturates: at
 # seven replicas it sends seven unicasts per request and sat at 85% of a core
 # while the leader was at 75%, so the measurement was of the client. Spreading
@@ -145,8 +148,12 @@ cmd_start_tc() {
 # where the experiment wants it. The logs are concatenated, and parse.py reads
 # one "Completed" line per client wherever it came from.
 cmd_client() {
-    local variant=$1 requests=$2 clients=$3 warmup=$4 procs=$5 log=$6
-    local per=$(( clients / procs )) j pids=()
+    local variant=$1 requests=$2 clients=$3 warmup=$4 procs=$5 log=$6 duration=${7:-0}
+    local per=$(( clients / procs )) j pids=() dur_opt=()
+
+    # Stop on a clock rather than a request count, so that every client of the
+    # run measures the same window -- see run.sh.
+    [ "$duration" -gt 0 ] && dur_opt=(-D "$duration")
 
     if [ $(( per * procs )) -ne "$clients" ]; then
         echo "clients ($clients) must divide by processes ($procs)" >&2
@@ -168,6 +175,7 @@ cmd_client() {
             taskset -c "${CLIENT_CPU_LIST[$(( j % ${#CLIENT_CPU_LIST[@]} ))]}" \
                 "$root/build/$variant/client" \
                 -c "$root/config.txt" -m vr -n "$requests" -t "$per" -w "$warmup" \
+                "${dur_opt[@]}" \
             > "$log.$j" 2>&1 &
         pids+=($!)
     done
@@ -208,8 +216,9 @@ cmd_stop() {
 case "${1:-}" in
     start-replicas) shift; cmd_start_replicas "$@" ;;
     start-tc)       shift; cmd_start_tc "$@" ;;
-    xdp-start)      shift; cmd_xdp_start "$@" ;;
+    leader-cpu)     shift; cmd_leader_cpu "$@" ;;
+    sample-cpu)     shift; cmd_sample_cpu "$@" ;;
     client)         shift; cmd_client "$@" ;;
     stop)           cmd_stop ;;
-    *) echo "usage: $0 {start-replicas <variant> <n>|start-tc <leader>|client ...|stop}" >&2; exit 1 ;;
+    *) echo "usage: $0 {start-replicas <variant> <n>|start-tc <leader>|leader-cpu [idx]|client ...|stop}" >&2; exit 1 ;;
 esac

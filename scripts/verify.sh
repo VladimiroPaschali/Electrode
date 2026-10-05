@@ -4,7 +4,11 @@
 # is scripts/verify-node.sh.
 #
 #   REPLICAS=31 ./verify.sh [variant ...]    default: all four, three replicas
-#   sudo scripts/cluster.sh up <n>           on grecale first
+#   sudo CLIENTS_ON_DUT=0 scripts/cluster.sh up <n>    on grecale first
+#
+# CLIENTS_ON_DUT=0 because this check drives the client from a namespace on
+# grecale. Where the broadcast is duplicated does not depend on where the
+# clients live, so the counts below mean the same thing in either topology.
 #
 # What distinguishes the four is not visible in the throughput, and three of
 # them would produce a full set of plausible numbers if their offload silently

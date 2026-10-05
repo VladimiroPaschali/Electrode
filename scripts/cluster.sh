@@ -12,9 +12,15 @@
 # crosses the DUT and comes back, in all four variants alike. That is the only
 # thing that makes the four numbers comparable.
 #
-#   sudo ./cluster.sh up 3      three replicas and a client
+#   sudo ./cluster.sh up 3      three replicas (and a client, see below)
 #   sudo ./cluster.sh down      remove everything it made
 #   ./cluster.sh show           what is there now
+#
+# With CLIENTS_ON_DUT=1, the default, the clients do not live here at all: they
+# run on the fan-out node, which has the cores to spare. Grecale was the limit
+# otherwise -- it could not offer enough load to bring the fan-out core near
+# saturation, and a comparison of two duplication paths on a core with headroom
+# compares nothing.
 #
 # Nothing here survives a reboot and nothing touches the root namespace's own
 # addressing: `down` removes the namespaces, and the macvlans go with them.
@@ -32,6 +38,11 @@ FANOUT_PORT=${FANOUT_PORT:-12000}
 # itself rather than in a namespace here -- the duplication point is then a
 # cluster member and not a machine the comparison needs on top.
 DUT_REPLICA=${DUT_REPLICA:-0}
+# The clients run on the fan-out node rather than here. Nothing has to route
+# for them then: they send from the fan-out node's own address, and the replies
+# come back to it and go up its stack -- the program already passes anything
+# addressed to the local address that is not the fan-out port.
+CLIENTS_ON_DUT=${CLIENTS_ON_DUT:-1}
 PREFIX=${PREFIX:-192.168.101}
 DEV=mv
 REPLICA_BASE=${REPLICA_BASE:-10}  # replica i is $PREFIX.$((REPLICA_BASE+i))
@@ -87,7 +98,7 @@ cmd_up() {
     # One fewer namespace when the fan-out node takes the last replica.
     local_n=$(( DUT_REPLICA ? n - 1 : n ))
     for (( i = 0; i < local_n; i++ )); do hosts+=( $(( REPLICA_BASE + i )) ); done
-    hosts+=( "$CLIENT_HOST" )
+    [ "$CLIENTS_ON_DUT" = 1 ] || hosts+=( "$CLIENT_HOST" )
 
     for host in "${hosts[@]}"; do make_ns "$host"; done
     for host in "${hosts[@]}"; do route_ns "$host" "${hosts[@]}"; done
@@ -119,13 +130,18 @@ cmd_up() {
     for (( i = 0; i < local_n; i++ )); do mac_of $(( REPLICA_BASE + i )) >> "$root/config.macs"; done
     [ "$DUT_REPLICA" = 1 ] && cat "$root/config.gwmac" >> "$root/config.macs"
 
-    # The client is not a replica, but the fan-out node routes for it too.
-    echo "$(ip_of "$CLIENT_HOST")=$(mac_of "$CLIENT_HOST")" > "$root/config.extra"
+    # The client is not a replica, but the fan-out node routes for it too --
+    # unless it runs there, in which case there is nothing to route and the
+    # file is empty.
+    : > "$root/config.extra"
+    [ "$CLIENTS_ON_DUT" = 1 ] || \
+        echo "$(ip_of "$CLIENT_HOST")=$(mac_of "$CLIENT_HOST")" > "$root/config.extra"
 
 
     hosts_write "${hosts[@]}"
 
-    echo "up: $n replicas + client${DUT_REPLICA:+$([ "$DUT_REPLICA" = 1 ] && echo " (the last on the fan-out node)")}"
+    echo "up: $n replicas$([ "$DUT_REPLICA" = 1 ] && echo " (the last on the fan-out node)")" \
+         "$([ "$CLIENTS_ON_DUT" = 1 ] && echo "; clients on the fan-out node" || echo "+ client")"
     cmd_show
 }
 

@@ -47,7 +47,7 @@
 static void
 Usage(const char *progName)
 {
-        fprintf(stderr, "usage: %s [-n requests] [-t threads] [-w warmup-secs] [-l latency-file] [-q dscp] [-d delay-ms] -c conf-file -m unreplicated|vr|fastpaxos|spec\n",
+        fprintf(stderr, "usage: %s [-n requests | -D seconds] [-t threads] [-w warmup-secs] [-l latency-file] [-q dscp] [-d delay-ms] -c conf-file -m unreplicated|vr|fastpaxos|spec\n",
                 progName);
         exit(1);
 }
@@ -64,6 +64,12 @@ int main(int argc, char **argv)
     int numClients = 1;
     int numRequests = 100;
     int warmupSec = 0;
+    /* -D: measure for this many seconds instead of for numRequests requests,
+     * so that every client of a run measures the same window. With a request
+     * count they stop at different times and the harness, which sums the
+     * per-client rates, credits whichever client ran while the cluster was
+     * least loaded. */
+    int durationSec = 0;
     int dscp = 0;
     uint64_t delay = 0;
     
@@ -80,7 +86,7 @@ int main(int argc, char **argv)
 
     // Parse arguments
     int opt;
-    while ((opt = getopt(argc, argv, "c:d:q:l:m:n:t:w:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:d:q:l:m:n:t:w:D:")) != -1) {
         switch (opt) {
         case 'c':
             configPath = optarg;
@@ -141,6 +147,20 @@ int main(int argc, char **argv)
             {
                 fprintf(stderr,
                         "option -n requires a numeric arg\n");
+                Usage(argv[0]);
+            }
+            break;
+        }
+
+        case 'D':
+        {
+            char *strtolPtr;
+            durationSec = strtoul(optarg, &strtolPtr, 10);
+            if ((*optarg == '\0') || (*strtolPtr != '\0') ||
+                (durationSec <= 0))
+            {
+                fprintf(stderr,
+                        "option -D requires a numeric arg\n");
                 Usage(argv[0]);
             }
             break;
@@ -233,7 +253,7 @@ int main(int argc, char **argv)
         specpaxos::BenchmarkClient *bench =
             new specpaxos::BenchmarkClient(*client, transport,
                                            numRequests, delay,
-                                           warmupSec);
+                                           warmupSec, durationSec);
 
         transport.Timer(0, [=]() { bench->Start(); });
         clients.push_back(client);

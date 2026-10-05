@@ -4,7 +4,7 @@
 #   ./build.sh [replicas]
 #
 # Three C++ builds, because the broadcast is a compile-time choice in
-# vr/replica.cc and lib/transportcommon.h:
+# vr/replica.cc and lib/transportcommon.h -- one per point of the comparison:
 #
 #   baseline   SendMessageToAll() sends one packet per follower
 #   tc         one packet, cloned on the leader's own TC egress hook
@@ -36,15 +36,14 @@ build_one() {  # $1 = name, $2 = CXXFLAGS
 build_one baseline ""
 build_one tc "-DTC_BROADCAST"
 build_one xdp "-DXDP_BROADCAST"
-# The other half of Electrode, the leader's PrepareOK handling in XDP, on top
-# of the broadcast offload: the broadcast takes the sends off the leader and
-# the prune takes the receives, which is where its time then goes.
-build_one xdp-prune "-DXDP_BROADCAST -DFAST_QUORUM_PRUNE"
 make clean >/dev/null 2>&1 || true
 
+# Only FastBroadCast, the TC program the `tc` point attaches. The five XDP
+# programs behind ELECTRODE_XDP_OFFLOADS belong to Electrode's other offloads,
+# which nothing here measures, and none of them is ever loaded.
 echo "=== eBPF, CLUSTER_SIZE=$n"
 make -C xdp-handler clean >/dev/null
-make -C xdp-handler EXTRA_CFLAGS="-DCLUSTER_SIZE=$n -DELECTRODE_XDP_OFFLOADS -DFAST_QUORUM_PRUNE" >/dev/null
+make -C xdp-handler EXTRA_CFLAGS="-DCLUSTER_SIZE=$n" >/dev/null
 
 echo
 echo "built:"

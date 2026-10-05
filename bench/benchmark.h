@@ -39,7 +39,7 @@ class BenchmarkClient
 public:
     BenchmarkClient(Client &client, Transport &transport,
                     int numRequests, uint64_t delay,
-                    int warmupSec,
+                    int warmupSec, int durationSec = 0,
                     string latencyFilename = "");
     void Start();
     void OnReply(const string &request, const string &reply);
@@ -60,6 +60,15 @@ private:
     uint64_t delay;
     int n;
     int warmupSec;
+    /* When > 0 the measurement phase ends on a timer rather than after
+     * numRequests. Clients that stop on a request count stop at different
+     * times, and the harness computes throughput as the sum of the per-client
+     * rates -- which then credits whichever client happened to run in the
+     * least loaded window. At thirty-one replicas they diverged by 10x and the
+     * sum read twice the throughput the cluster sustained. Ending on a clock
+     * gives every client the same window.
+     */
+    int durationSec;
     struct timeval startTime;
     struct timeval endTime;
     string latencyFilename;
